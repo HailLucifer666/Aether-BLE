@@ -1,0 +1,12 @@
+aether-dashboard/node_modules/
+aether-dashboard/.next/
+aether-dashboard/.npm-cache/
+aether-dashboard/tsconfig.tsbuildinfo
+
+aether-bridge/.venv/
+aether-bridge/.pip-cache/
+aether-bridge/__pycache__/
+
+.claude/
+
+graphify-out/

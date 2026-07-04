@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom scrollbar for the handoff log */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: theme("colors.slate.900");
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: theme("colors.slate.700");
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: theme("colors.slate.600");
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: theme("colors.slate.700") theme("colors.slate.900");
+}

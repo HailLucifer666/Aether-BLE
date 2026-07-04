@@ -1,0 +1,5 @@
+# Skip doc semantic extraction (no LLM API key configured in this environment) —
+# code graph still covers all source files. Remove this file and re-run
+# `graphify . --update --force` once an API key is available to add doc nodes.
+*.md
+*.txt
