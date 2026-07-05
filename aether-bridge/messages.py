@@ -113,3 +113,51 @@ def build_conversation_message(
         "phaseTo": phase_to,
         "conversationEvent": conversation_event,
     }
+
+
+def build_ranging_message(
+    contest: dict | None,
+    chirp: dict | None,
+    fusion_reason: str,
+    ranging_event: dict | None,
+) -> dict:
+    """Build the tier-2 ranging broadcast message (Phase 4).
+
+    Sent as a separate JSON message on the same WebSocket as the election
+    and conversation broadcasts. Additive schema - the existing election and
+    conversation contracts are untouched. The dashboard dispatches inbound
+    messages by `type`, so a new "ranging" type slots in without affecting
+    prior consumers:
+
+        {"type": "ranging",
+         "contest": {"incumbentId": "SIM-A", "challengerId": "SIM-B",
+                     "incumbentRssi": -60.0, "challengerRssi": -58.0,
+                     "atTick": 4830} | null,
+         "chirp": {"measurements": [{"scannerId": "SIM-A", "tofUs": 2000.0,
+                                     "distanceM": 0.686},
+                                    {"scannerId": "SIM-B", "tofUs": 1000.0,
+                                     "distanceM": 0.343}],
+                   "winnerId": "SIM-B", "sameRoom": true,
+                   "resolvedTick": 4831} | null,
+         "fusionReason": "ble-only" | "chirp-confirmed" | "chirp-resolved-tie"
+                       | "chirp-room-containment",
+         "rangingEvent": {"phase": "CHIRP", "contestIncumbent": "SIM-A",
+                          "contestChallenger": "SIM-B", "winnerId": "SIM-B",
+                          "sameRoom": true, "atTick": 4831} | null}
+
+    `contest` is the current (most-recent) contest state, or null when the
+    election is not contested. `chirp` is the most-recent chirp resolution
+    still considered relevant (null before the first chirp). `fusionReason`
+    is the machine-readable tag from ranging.FusionResult.reason describing
+    how the latest owner decision was reached. `rangingEvent` is one-shot
+    (caller clears it after one broadcast, mirroring wakeOutcome /
+    conversationEvent semantics) and marks a chirp round the dashboard should
+    react to with the "chirp ping" animation.
+    """
+    return {
+        "type": "ranging",
+        "contest": contest,
+        "chirp": chirp,
+        "fusionReason": fusion_reason,
+        "rangingEvent": ranging_event,
+    }

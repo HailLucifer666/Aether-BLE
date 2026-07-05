@@ -1,5 +1,5 @@
-"""Aether Protocol Phase 2/3 - multi-scanner mesh aggregator with leader election
-and portable conversation state.
+"""Aether Protocol Phase 2/3/4 - multi-scanner mesh aggregator with leader
+election, portable conversation state, and tiered ranging.
 
 Connects OUT as a WebSocket client to each configured peer scanner (real
 bridge.py instances or simulated_scanner.py instances - this module never
@@ -17,6 +17,18 @@ that migrates the active utterance to the new owner when ownership changes
 mid-sentence, so the assistant literally finishes its sentence on the next
 device. edge-tts is optional - if it's missing or the network is down, a
 synthetic utterance (no audio) keeps the migration demo working.
+
+Phase 4 adds tiered sensing: BLE alone (tier 1) resolves ~80% of
+arbitrations; the remaining photo-finishes escalate to a near-ultrasound
+chirp (tier 2) whose time-of-flight + room-containment bits settle ties
+deterministically. The pure fusion logic lives in ranging.py; this module
+owns the contest-detection hook (in the election tick loop), the ranging
+loop that fires one chirp per contest episode, and the fusion into the
+owner decision. Real audio capture is NOT implemented here - the ranging
+source is an injectable callable (see Aggregator.__init__ ranging_source)
+and defaults to a deterministic synthetic source. That callable is the
+SEAM where a real microphone/capture backend plugs in without touching the
+fusion logic.
 """
 
 import argparse
@@ -41,7 +53,16 @@ from conversation import (
     utterance_progress,
 )
 from election import ChallengerState, Handoff, ScannerState, elect
-from messages import build_conversation_message, build_election_message
+from messages import build_conversation_message, build_election_message, build_ranging_message
+from ranging import (
+    ChirpMeasurement,
+    ChirpResult,
+    Contest,
+    chirp_from_measurements,
+    detect_contest,
+    fuse,
+    tof_to_distance,
+)
 from smoothing import apply_ema
 
 DEFAULT_PORT = 8766
@@ -50,6 +71,13 @@ PEER_RECONNECT_DELAY_SECONDS = 2.0
 PRESENCE_TIMEOUT_SECONDS = 6.0
 KEYPRESS_POLL_INTERVAL_SECONDS = 0.05
 WAKE_KEYS = {b" ", b"\r"}
+
+# Phase 4: how many ticks a chirp resolution stays "fresh" for fusion before
+# the aggregator demands a new chirp if the contest is still active. Two
+# ticks matches the election hysteresis window (HYSTERESIS_CONSECUTIVE) so a
+# chirp-backed override needs to survive the same scrutiny a hysteresis
+# handoff would.
+CHIRP_FRESH_TICKS = 2
 
 
 @dataclass
@@ -87,6 +115,112 @@ def _now_hms() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 - ranging source seam.
+#
+# A ranging source is a callable that turns a Contest into a ChirpResult.
+# Real audio capture (phone mic listening for a coded 18-21 kHz chirp) plugs
+# in here. The default below is a DETERMINISTIC SYNTHETIC source: it models
+# each candidate scanner's distance from the phone as a fixed geometric
+# layout (incumbent nearer, challenger farther) and synthesizes ToF
+# measurements accordingly. It exists so the tier-2 logic, fusion, and
+# dashboard viz are exercised end-to-end without a microphone - and so a
+# future build can swap in `real_ranging_source` by passing a different
+# callable to Aggregator.__init__ without touching ranging.py or the fusion
+# logic. The synthetic source is honest about what it is: it never claims to
+# have heard a real chirp; it produces the same ChirpResult shape a real
+# source would.
+#
+# Geometric model: the incumbent is treated as ~1.5 m from the phone, the
+# challenger as ~2.5 m. To convert distance to one-way ToF we invert
+# tof_to_distance: tof_us = distance_m / speed_of_sound * 1e6.
+# ---------------------------------------------------------------------------
+
+RangingSource = "Callable[[Contest, int], ChirpResult | None]"
+
+
+def _distance_to_tof_us(distance_m: float) -> float:
+    """Inverse of ranging.tof_to_distance: meters -> one-way microseconds."""
+    return (distance_m / 343.0) * 1_000_000.0
+
+
+def synthetic_ranging_source(
+    contest: Contest,
+    tick: int,
+    scanner_distances: dict[str, float] | None = None,
+) -> ChirpResult | None:
+    """Default ranging source: deterministic synthetic ToF from geometry.
+
+    Returns a ChirpResult where each contest party that is "in range"
+    produces a measurement whose ToF reflects its modelled distance from the
+    phone. The model is intentionally simple and deterministic so the fusion
+    logic and dashboard viz are exercised without a microphone. Both parties
+    are modelled as hearing the chirp (same_room=True) at their configured
+    distances; override `scanner_distances` to inject a wall (drop a party)
+    or change the layout. This is the integration point a real mic capture
+    backend replaces.
+    """
+    distances = scanner_distances or {
+        contest.incumbent_id: 1.5,
+        contest.challenger_id: 2.5,
+    }
+    measurements = []
+    for scanner_id in (contest.incumbent_id, contest.challenger_id):
+        distance_m = distances.get(scanner_id)
+        if distance_m is None:
+            continue  # modelled as behind a wall / out of beam: not heard
+        measurements.append(
+            ChirpMeasurement(
+                scanner_id=scanner_id,
+                tof_us=_distance_to_tof_us(distance_m),
+                distance_m=distance_m,
+            )
+        )
+    return chirp_from_measurements(tuple(measurements), contest, tick)
+
+
+def make_geometry_ranging_source(geometry: dict[str, tuple[float, str]]):
+    """Build a deterministic ranging source from a per-scanner geometry map.
+
+    `geometry` maps scanner id -> (distance_meters, room) where room is "in"
+    (same room as the phone, hears the chirp) or "out" (behind a wall / out of
+    beam, does NOT hear the chirp). The returned callable is a thin wrapper over
+    synthetic_ranging_source with this override semantics:
+
+      - a scanner declared "in"  -> modelled at its declared distance;
+      - a scanner declared "out" -> dropped (no measurement); this drop IS the
+        wall, and the existing fuse() then returns chirp-room-containment when
+        the BLE winner is the dropped one;
+      - a scanner NOT in the map -> keeps the documented default (in-room at
+        1.5m if it's the incumbent, 2.5m if the challenger).
+
+    So `--ranging-geometry "B=4.0:out"` alone puts B behind a wall and leaves A
+    at its default. This is the integration point the `--ranging-geometry` CLI
+    flag wires into; it keeps synthetic_ranging_source itself unchanged (the
+    default no-geometry path is byte-for-byte the prior behavior).
+    """
+    in_room_declarations = {
+        scanner_id: distance_m
+        for scanner_id, (distance_m, room) in geometry.items()
+        if room == "in"
+    }
+
+    def source(contest: Contest, tick: int) -> ChirpResult | None:
+        distances = {
+            contest.incumbent_id: 1.5,
+            contest.challenger_id: 2.5,
+        }
+        # "in" declarations override the default distance for the named
+        # scanner; "out" declarations remove it entirely.
+        distances.update(in_room_declarations)
+        for scanner_id, (_distance_m, room) in geometry.items():
+            if room == "out":
+                distances.pop(scanner_id, None)
+        return synthetic_ranging_source(contest, tick, scanner_distances=distances)
+
+    return source
+
+
 class Aggregator:
     def __init__(
         self,
@@ -95,6 +229,7 @@ class Aggregator:
         port: int,
         tick_ms: int,
         peer_offsets: dict[str, float] | None = None,
+        ranging_source: "RangingSource | None" = None,
     ) -> None:
         self.peer_urls = peer_urls
         self.host = host
@@ -127,6 +262,24 @@ class Aggregator:
         self._conversation: ConversationState = ConversationState.empty()
         self._pending_conversation_event: dict | None = None
         self._conversation_dirty = False
+
+        # Phase 4: tiered ranging. The ranging source is the SEAM where real
+        # audio capture plugs in; it defaults to the deterministic synthetic
+        # source (see synthetic_ranging_source). _active_contest is the most
+        # recent detect_contest() result while a contest is live; it clears
+        # to None once the contest resolves. _last_chirp is the most-recent
+        # ChirpResult still within CHIRP_FRESH_TICKS of being produced.
+        # _last_fusion_reason is broadcast every ranging message so the
+        # dashboard can label how the latest owner decision was reached.
+        # _pending_ranging_event mirrors the wakeOutcome/conversationEvent
+        # one-shot pattern: set when a chirp fires, broadcast once, cleared.
+        self._ranging_source = ranging_source or synthetic_ranging_source
+        self._active_contest: Contest | None = None
+        self._last_chirp: ChirpResult | None = None
+        self._last_chirp_tick: int = -1
+        self._last_fusion_reason: str = "ble-only"
+        self._pending_ranging_event: dict | None = None
+        self._ranging_dirty = False
 
         self.clients: set = set()
         self._stop_event = asyncio.Event()
@@ -242,10 +395,33 @@ class Aggregator:
             scanners = self._election_scanner_states()
             previous_owner = self._owner
             result = elect(self._owner, scanners, self._challenger)
-            self._owner = result.new_owner
+            ble_owner = result.new_owner
             self._challenger = result.challenger
-            if result.handoff is not None:
+
+            # Phase 4: detect a BLE photo-finish and (when one is active and
+            # a fresh chirp is available) fuse the chirp into the owner
+            # decision. The contest object is computed every tick so a fresh
+            # escalation is noticed immediately; the chirp is produced by the
+            # ranging loop (one per contest episode) and consumed here.
+            contest = detect_contest(ble_owner, scanners, self._tick)
+            self._active_contest = contest
+            chirp = self._fresh_chirp()
+            fusion = fuse(ble_owner, scanners, contest, chirp)
+            self._last_fusion_reason = fusion.reason
+            self._owner = fusion.owner
+
+            # A tier-2 override counts as a handoff for logging/broadcast
+            # purposes (the owner visibly changed), even though elect()
+            # itself didn't emit a Handoff - this is the whole point of
+            # tier 2: it produces handoffs tier 1 cannot.
+            if fusion.overridden_by_ranging and previous_owner is not None and fusion.owner != previous_owner:
+                self._record_handoff(
+                    Handoff(from_id=previous_owner, to_id=fusion.owner)
+                )
+                self._ranging_dirty = True
+            elif result.handoff is not None:
                 self._record_handoff(result.handoff)
+
             # Phase 3: if ownership changed while an utterance is active and
             # being spoken by the outgoing owner, kick off the conversation
             # handoff FSM. Catch every ownership change (not just the
@@ -253,10 +429,87 @@ class Aggregator:
             # changes the owner without emitting a Handoff from elect().
             if (
                 previous_owner is not None
-                and result.new_owner is not None
-                and previous_owner != result.new_owner
+                and self._owner is not None
+                and previous_owner != self._owner
             ):
-                self._maybe_begin_conversation_handoff(previous_owner, result.new_owner)
+                self._maybe_begin_conversation_handoff(previous_owner, self._owner)
+
+            # Surface ranging activity whenever a contest is live or a fresh
+            # chirp exists, so the dashboard's ranging panel reflects state.
+            if contest is not None or chirp is not None:
+                self._ranging_dirty = True
+
+    def _fresh_chirp(self) -> ChirpResult | None:
+        """Return _last_chirp if it's still within CHIRP_FRESH_TICKS, else None.
+
+        A chirp resolution is only useful for fusion while it's recent - the
+        phone may have moved since. Older chirps are discarded so a stale
+        reading can't keep overriding the live BLE election indefinitely.
+        """
+        if self._last_chirp is None:
+            return None
+        if self._tick - self._last_chirp_tick > CHIRP_FRESH_TICKS:
+            return None
+        return self._last_chirp
+
+    async def _ranging_loop(self) -> None:
+        """Fire one tier-2 chirp per contest episode.
+
+        Triggered when a contest is active AND we don't already have a fresh
+        chirp for the same contest pair. The ranging source (default:
+        deterministic synthetic; swappable for real mic capture) produces the
+        ChirpResult, which the election tick loop then consumes via
+        _fresh_chirp() + fuse(). One chirp per episode keeps the duty cycle
+        low (the on-demand tier-2 promise): once a chirp is fresh, subsequent
+        ticks reuse it until it expires; a brand-new contest (different
+        incumbent/challenger pair) demands a new chirp.
+        """
+        while not self._stop_event.is_set():
+            await asyncio.sleep(self.tick_interval_seconds)
+            contest = self._active_contest
+            if contest is None:
+                continue
+            if self._has_fresh_chirp_for(contest):
+                continue
+
+            chirp = self._ranging_source(contest, self._tick)
+            if chirp is None:
+                continue
+            self._last_chirp = chirp
+            self._last_chirp_tick = self._tick
+            self._stage_ranging_event(contest, chirp)
+            self._ranging_dirty = True
+            print(
+                f"[aggregator] RANGING chirp tick={self._tick} "
+                f"{contest.incumbent_id}<->{contest.challenger_id} "
+                f"winner={chirp.winner_id} same_room={chirp.same_room}"
+            )
+
+    def _has_fresh_chirp_for(self, contest: Contest) -> bool:
+        """Is the most-recent chirp still fresh AND covering this contest pair?
+
+        A chirp covers the contest if both contest parties appear in its
+        measurements (same_room True path) - i.e. the chirp already settled
+        exactly this photo-finish. If only one party (or neither) was heard,
+        the situation may have changed, so we allow a refire.
+        """
+        existing = self._last_chirp
+        if existing is None:
+            return False
+        if self._tick - self._last_chirp_tick > CHIRP_FRESH_TICKS:
+            return False
+        heard = {m.scanner_id for m in existing.measurements}
+        return {contest.incumbent_id, contest.challenger_id} <= heard
+
+    def _stage_ranging_event(self, contest: Contest, chirp: ChirpResult) -> None:
+        self._pending_ranging_event = {
+            "phase": "CHIRP",
+            "contestIncumbent": contest.incumbent_id,
+            "contestChallenger": contest.challenger_id,
+            "winnerId": chirp.winner_id,
+            "sameRoom": chirp.same_room,
+            "atTick": self._tick,
+        }
 
     def _maybe_begin_conversation_handoff(self, from_scanner: str, to_scanner: str) -> None:
         if not has_active_utterance(self._conversation):
@@ -533,10 +786,14 @@ class Aggregator:
             conversation_message = self._current_conversation_message()
             # conversationEvent is one-shot too.
             self._pending_conversation_event = None
+            ranging_message = self._current_ranging_message()
+            # rangingEvent is one-shot too.
+            self._pending_ranging_event = None
             if not self.clients:
-                # Even with no clients, clear the dirty flag so it doesn't
+                # Even with no clients, clear the dirty flags so they don't
                 # queue up an unnecessary broadcast on the next connect.
                 self._conversation_dirty = False
+                self._ranging_dirty = False
                 continue
             payloads = [json.dumps(election_message)]
             # Only attach the conversation message when there's something to
@@ -544,7 +801,13 @@ class Aggregator:
             # This keeps the wire quiet when no conversation has started.
             if conversation_message is not None:
                 payloads.append(json.dumps(conversation_message))
+            # Only attach the ranging message when tier 2 has been invoked
+            # (an active contest, a fresh chirp, or a pending chirp event).
+            # This keeps the wire quiet in the common uncontested case.
+            if ranging_message is not None:
+                payloads.append(json.dumps(ranging_message))
             self._conversation_dirty = False
+            self._ranging_dirty = False
             stale = []
             for client in self.clients:
                 try:
@@ -599,6 +862,51 @@ class Aggregator:
             conversation_event=self._pending_conversation_event,
         )
 
+    def _current_ranging_message(self) -> dict | None:
+        """Build the tier-2 ranging broadcast, or None if tier 2 is idle.
+
+        Suppresses the message entirely when there is no active contest, no
+        fresh chirp, and no pending one-shot ranging event - so before any
+        photo-finish escalates, the wire carries only election (and possibly
+        conversation) messages. Once a contest fires, the message flows every
+        tick so the dashboard's ranging panel reflects live state.
+        """
+        contest = self._active_contest
+        chirp = self._fresh_chirp()
+        if contest is None and chirp is None and self._pending_ranging_event is None:
+            return None
+
+        contest_dict = None
+        if contest is not None:
+            contest_dict = {
+                "incumbentId": contest.incumbent_id,
+                "challengerId": contest.challenger_id,
+                "incumbentRssi": contest.incumbent_rssi,
+                "challengerRssi": contest.challenger_rssi,
+                "atTick": contest.at_tick,
+            }
+        chirp_dict = None
+        if chirp is not None:
+            chirp_dict = {
+                "measurements": [
+                    {
+                        "scannerId": m.scanner_id,
+                        "tofUs": m.tof_us,
+                        "distanceM": m.distance_m,
+                    }
+                    for m in chirp.measurements
+                ],
+                "winnerId": chirp.winner_id,
+                "sameRoom": chirp.same_room,
+                "resolvedTick": chirp.resolved_tick,
+            }
+        return build_ranging_message(
+            contest=contest_dict,
+            chirp=chirp_dict,
+            fusion_reason=self._last_fusion_reason,
+            ranging_event=self._pending_ranging_event,
+        )
+
     # -- Terminal readout ---------------------------------------------------
 
     def _render_terminal_line(self) -> str:
@@ -630,6 +938,7 @@ class Aggregator:
         peer_tasks = [asyncio.ensure_future(self._peer_connection_loop(url)) for url in self.peer_urls]
         tick_task = asyncio.ensure_future(self._election_tick_loop())
         conversation_task = asyncio.ensure_future(self._conversation_fsm_loop())
+        ranging_task = asyncio.ensure_future(self._ranging_loop())
         broadcast_task = asyncio.ensure_future(self._broadcast_loop())
         readout_task = asyncio.ensure_future(self._terminal_readout_loop())
         keypress_task = asyncio.ensure_future(self._stdin_keypress_loop())
@@ -637,6 +946,7 @@ class Aggregator:
         background_tasks = [
             tick_task,
             conversation_task,
+            ranging_task,
             broadcast_task,
             readout_task,
             keypress_task,
@@ -705,6 +1015,57 @@ def parse_peer_urls(raw: str) -> tuple[list[str], dict[str, float]]:
     return urls, offsets
 
 
+def parse_ranging_geometry(raw: str) -> dict[str, tuple[float, str]]:
+    """Parse the --ranging-geometry CLI value into a per-scanner geometry map.
+
+    Format: a comma-separated list of `id=distance:room` segments, where
+    `distance` is the scanner's distance from the phone in meters and `room`
+    is `in` (same room as the phone - hears the chirp) or `out` (behind a wall
+    / out of beam - does NOT hear the chirp). Examples:
+        A=1.5:in,B=2.5:in        both in-room at the given distances
+        A=1.5:in,B=2.5:out       B behind a wall -> room-containment override
+        SIM-B=4.0:out            only declare B; A falls back to its default
+
+    Returns a dict {scanner_id: (distance_m, "in" | "out")}. Empty segments are
+    skipped; an out-of-set room token, a non-numeric distance, or a missing
+    piece raises ValueError with the offending segment quoted. The result is
+    consumed by make_geometry_ranging_source, which drops every "out" scanner
+    before handing the layout to synthetic_ranging_source - that drop IS the
+    wall in the demo (the existing fuse() then returns chirp-room-containment).
+    """
+    geometry: dict[str, tuple[float, str]] = {}
+    for part in raw.split(","):
+        segment = part.strip()
+        if not segment:
+            continue
+        id_str, sep, rest = segment.partition("=")
+        id_str = id_str.strip()
+        if not sep or not id_str:
+            raise ValueError(
+                f"Invalid --ranging-geometry segment {segment!r}: expected 'id=distance:room'."
+            )
+        rest = rest.strip()
+        distance_str, colon, room = rest.partition(":")
+        if not colon:
+            raise ValueError(
+                f"Invalid --ranging-geometry segment {segment!r}: missing ':room' (use :in or :out)."
+            )
+        distance_str = distance_str.strip()
+        room = room.strip()
+        if room not in ("in", "out"):
+            raise ValueError(
+                f"Invalid --ranging-geometry segment {segment!r}: room {room!r} must be 'in' or 'out'."
+            )
+        try:
+            distance_m = float(distance_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid --ranging-geometry segment {segment!r}: distance {distance_str!r} is not a number."
+            ) from exc
+        geometry[id_str] = (distance_m, room)
+    return geometry
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Aether Protocol mesh aggregator with leader election.")
     parser.add_argument(
@@ -722,12 +1083,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="WebSocket bind host for this aggregator's own server (default: 127.0.0.1).")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"WebSocket bind port (default: {DEFAULT_PORT}).")
     parser.add_argument("--tick-ms", type=int, default=DEFAULT_TICK_MS, help=f"Election tick interval in milliseconds (default: {DEFAULT_TICK_MS}).")
+    parser.add_argument(
+        "--ranging-geometry",
+        default=None,
+        help=(
+            "Optional per-scanner tier-2 geometry for the synthetic ranging "
+            "source, as a comma-separated list of id=distance_meters:room where "
+            "room is 'in' (same room as the phone, hears the chirp) or 'out' "
+            "(behind a wall, does NOT hear the chirp). A scanner marked 'out' "
+            "is dropped from chirp measurements; when the BLE winner is the one "
+            "dropped, fusion overrides it with chirp-room-containment - the "
+            "Phase 4 wall demo. Default (flag absent): both contest parties in "
+            "room at the documented distances (1.5m incumbent, 2.5m challenger). "
+            "Example: --ranging-geometry \"A=1.5:in,B=2.5:out\""
+        ),
+    )
     return parser.parse_args(argv)
 
 
 async def main_async(args: argparse.Namespace) -> None:
     peer_urls, peer_offsets = parse_peer_urls(args.peers)
-    aggregator = Aggregator(peer_urls, args.host, args.port, args.tick_ms, peer_offsets)
+    ranging_source = None
+    if args.ranging_geometry is not None:
+        geometry = parse_ranging_geometry(args.ranging_geometry)
+        ranging_source = make_geometry_ranging_source(geometry)
+    aggregator = Aggregator(
+        peer_urls, args.host, args.port, args.tick_ms, peer_offsets, ranging_source=ranging_source
+    )
     try:
         await aggregator.run()
     except KeyboardInterrupt:

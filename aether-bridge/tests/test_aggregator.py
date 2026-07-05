@@ -444,6 +444,106 @@ def test_parse_peer_urls_rejects_bad_offset():
 
 
 # ---------------------------------------------------------------------------
+# Phase 4: --ranging-geometry CLI flag (the wall demo)
+# ---------------------------------------------------------------------------
+
+def test_parse_ranging_geometry_parses_in_and_out():
+    geometry = agg_mod.parse_ranging_geometry("A=1.5:in,B=2.5:out")
+    assert geometry == {
+        "A": (1.5, "in"),
+        "B": (2.5, "out"),
+    }
+
+
+def test_parse_ranging_geometry_skips_empty_segments_and_strips():
+    geometry = agg_mod.parse_ranging_geometry(" A = 1.5 : in , , B=2.0:out , ")
+    assert geometry == {"A": (1.5, "in"), "B": (2.0, "out")}
+
+
+def test_parse_ranging_geometry_rejects_bad_room():
+    with pytest.raises(ValueError):
+        agg_mod.parse_ranging_geometry("A=1.5:wall")
+
+
+def test_parse_ranging_geometry_rejects_bad_distance():
+    with pytest.raises(ValueError):
+        agg_mod.parse_ranging_geometry("A=close:in")
+
+
+def test_parse_ranging_geometry_rejects_missing_room():
+    with pytest.raises(ValueError):
+        agg_mod.parse_ranging_geometry("A=1.5")
+
+
+def test_ranging_geometry_wall_demo_overrides_ble_with_room_containment():
+    """The Phase 4 killer demo: BLE ranks scanner-B as owner, but the geometry
+    declares B behind a wall (does not hear the chirp). The geometry-built
+    source must drop B from measurements, so fuse() overrides BLE and hands
+    ownership to the in-room scanner A with reason chirp-room-containment."""
+    from election import ScannerState
+    from ranging import Contest, fuse
+
+    def scanner(id_, rssi):
+        return ScannerState(id=id_, smoothed_rssi=rssi, present=True)
+
+    scanners = [scanner("A", -62.5), scanner("B", -62.0)]  # B 0.5dB louder
+    contest = Contest(
+        incumbent_id="A",
+        challenger_id="B",
+        incumbent_rssi=-62.5,
+        challenger_rssi=-62.0,
+        at_tick=1,
+    )
+    # BLE's owner pick is B (the louder, wrong scanner).
+    ble_owner = "B"
+
+    source = agg_mod.make_geometry_ranging_source(
+        {"A": (1.5, "in"), "B": (2.5, "out")}
+    )
+    chirp = source(contest, tick=2)
+    assert chirp is not None
+    # B is behind the wall -> absent from measurements; A is present.
+    heard_ids = {m.scanner_id for m in chirp.measurements}
+    assert "B" not in heard_ids, "behind-wall scanner must not appear in measurements"
+    assert "A" in heard_ids
+    assert chirp.winner_id == "A"
+
+    result = fuse(ble_owner, scanners, contest, chirp)
+    assert result.owner == "A", "fusion must override BLE's wrong pick with the in-room scanner"
+    assert result.reason == "chirp-room-containment"
+    assert result.overridden_by_ranging is True
+
+
+def test_ranging_geometry_default_keeps_both_parties_in_room():
+    """Regression guard: with no geometry override, the default source produces
+    measurements for both contest parties at the documented distances, so
+    fusion stays in the chirp-confirmed / chirp-resolved-tie family (never
+    room-containment)."""
+    from election import ScannerState
+    from ranging import Contest, fuse
+
+    def scanner(id_, rssi):
+        return ScannerState(id=id_, smoothed_rssi=rssi, present=True)
+
+    scanners = [scanner("A", -60.0), scanner("B", -60.0)]
+    contest = Contest(
+        incumbent_id="A", challenger_id="B",
+        incumbent_rssi=-60.0, challenger_rssi=-60.0, at_tick=1,
+    )
+    # Default source (no geometry) - same callable the aggregator uses by default.
+    chirp = agg_mod.synthetic_ranging_source(contest, tick=2)
+    assert chirp is not None
+    heard_ids = {m.scanner_id for m in chirp.measurements}
+    assert heard_ids == {"A", "B"}, "default geometry must keep both parties in-room"
+    assert chirp.same_room is True
+
+    result = fuse("A", scanners, contest, chirp)
+    assert result.reason in {"chirp-confirmed", "chirp-resolved-tie"}, (
+        f"default geometry must not produce a room-containment override, got {result.reason!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Phase 3: portable conversation state (say, FSM, broadcast envelope)
 # ---------------------------------------------------------------------------
 
@@ -758,3 +858,271 @@ def test_conversation_event_is_oneshot():
             await peer_server.wait_closed()
 
     run(inner())
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: tiered ranging (contest detection, chirp fusion, broadcast).
+#
+# These tests drive the full aggregator stack including the new ranging
+# integration in _election_tick_loop. They use a deterministic injected
+# ranging source (not the default synthetic one) so the fusion outcome is
+# pinned and assertable. The ranging loop itself is started alongside the
+# other loops in _start_aggregator_with_ranging below.
+# ---------------------------------------------------------------------------
+
+async def _start_aggregator_with_ranging(peer_urls, *, tick_ms=50, offsets=None, ranging_source=None):
+    """Like _start_aggregator but also starts the Phase 4 ranging loop.
+
+    The standard _start_aggregator deliberately starts only the election +
+    FSM + broadcast loops; the ranging loop is Phase 4-specific so it gets
+    its own starter to keep the pre-Phase-4 tests untouched.
+    """
+    agg = Aggregator(peer_urls, "127.0.0.1", 0, tick_ms, offsets, ranging_source=ranging_source)
+    server = await websockets.serve(agg._handle_client, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    tasks = [asyncio.ensure_future(agg._peer_connection_loop(u)) for u in peer_urls]
+    tasks.append(asyncio.ensure_future(agg._election_tick_loop()))
+    tasks.append(asyncio.ensure_future(agg._conversation_fsm_loop()))
+    tasks.append(asyncio.ensure_future(agg._ranging_loop()))
+    tasks.append(asyncio.ensure_future(agg._broadcast_loop()))
+
+    async def stop():
+        agg.stop()
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        for client in list(agg.clients):
+            await client.close()
+        server.close()
+        await server.wait_closed()
+
+    return agg, port, stop
+
+
+def test_no_ranging_broadcast_when_election_is_uncontested():
+    """Before any photo-finish, the wire carries only election messages -
+    the ranging message is suppressed entirely (mirrors how the conversation
+    message is suppressed before the first say)."""
+
+    async def inner():
+        # SIM-A is a runaway winner (15 dB louder); no contest ever fires.
+        url_a, push_a, srv_a = await _start_peer("SIM-A", -55.0)
+        url_b, push_b, srv_b = await _start_peer("SIM-B", -70.0)
+        agg, port, stop = await _start_aggregator_with_ranging([url_a, url_b], tick_ms=50)
+
+        try:
+            await _drain_peer_connections(agg, 2)
+            async with websockets.connect(f"ws://127.0.0.1:{port}") as client:
+                saw_types = set()
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 1.0
+                while loop.time() < deadline:
+                    try:
+                        raw = await asyncio.wait_for(client.recv(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        break
+                    msg = json.loads(raw)
+                    saw_types.add(msg.get("type"))
+                assert "ranging" not in saw_types, (
+                    "ranging broadcast emitted with no contest active"
+                )
+                assert "election" in saw_types
+        finally:
+            await stop()
+            for s in (srv_a, srv_b):
+                s.close()
+                await s.wait_closed()
+
+    run(inner())
+
+
+def test_contest_fires_and_chirp_overrides_ble_owner():
+    """Two scanners within the contest margin escalate to tier 2; the injected
+    ranging source reports the challenger as closer; the aggregator's owner
+    flips to the challenger via fusion (fusion_reason = chirp-resolved-tie)."""
+
+    async def inner():
+        # Push both scanners to near-equal calibrated RSSI (within the
+        # CONTEST_MARGIN_DB window, below HYSTERESIS_DB) so a contest fires.
+        url_a, push_a, srv_a = await _start_peer("SIM-A", -60.0)
+        url_b, push_b, srv_b = await _start_peer("SIM-B", -60.0)
+        agg, port, stop = await _start_aggregator_with_ranging(
+            [url_a, url_b],
+            tick_ms=50,
+            ranging_source=_make_source({"SIM-A": 2.5, "SIM-B": 1.5}),  # B closer
+        )
+
+        try:
+            await _drain_peer_connections(agg, 2)
+            # Hold both at -60 -> gap 0 -> squarely contested. The lexical
+            # tie-break would pick SIM-A as BLE owner forever; the chirp
+            # overrides to SIM-B (closer in the injected geometry). After the
+            # override SIM-B is also the BLE owner, so subsequent chirps
+            # confirm rather than override - both reasons prove tier 2 drove
+            # the decision.
+            for _ in range(10):
+                await push_a(_reading("SIM-A", -60.0))
+                await push_b(_reading("SIM-B", -60.0))
+                await asyncio.sleep(0.02)
+            # Let election ticks + ranging loop settle.
+            await asyncio.sleep(1.0)
+
+            assert agg._active_contest is not None, "contest never fired"
+            assert agg._last_chirp is not None, "chirp never produced"
+            assert agg._last_chirp.winner_id == "SIM-B"
+            # The decisive assertion: SIM-B owns, NOT SIM-A (the lexical
+            # winner BLE alone would pick). Only a chirp override can get
+            # us here given equal RSSI.
+            assert agg._owner == "SIM-B", (
+                "fusion did not override to chirp winner; without tier 2 the "
+                "lexical tie-break would have kept SIM-A as owner forever"
+            )
+            assert agg._last_fusion_reason in {
+                "chirp-resolved-tie", "chirp-confirmed"
+            }, f"expected a chirp-driven reason, got {agg._last_fusion_reason!r}"
+        finally:
+            await stop()
+            for s in (srv_a, srv_b):
+                s.close()
+                await s.wait_closed()
+
+    run(inner())
+
+
+def test_ranging_event_is_oneshot():
+    """The rangingEvent field is attached to exactly one broadcast per chirp,
+    then cleared - the same one-shot pattern as wakeOutcome/conversationEvent."""
+
+    async def inner():
+        url_a, push_a, srv_a = await _start_peer("SIM-A", -60.0)
+        url_b, push_b, srv_b = await _start_peer("SIM-B", -60.0)
+        agg, port, stop = await _start_aggregator_with_ranging(
+            [url_a, url_b],
+            tick_ms=50,
+            ranging_source=_make_source({"SIM-A": 1.5, "SIM-B": 2.5}),  # A closer
+        )
+
+        try:
+            await _drain_peer_connections(agg, 2)
+            for _ in range(8):
+                await push_a(_reading("SIM-A", -60.0))
+                await push_b(_reading("SIM-B", -60.0))
+                await asyncio.sleep(0.02)
+
+            async with websockets.connect(f"ws://127.0.0.1:{port}") as client:
+                # Wait for at least one ranging message with a rangingEvent,
+                # then confirm a follow-up ranging message arrives WITHOUT it.
+                saw_event = False
+                saw_clear = False
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 3.0
+                while loop.time() < deadline and not (saw_event and saw_clear):
+                    try:
+                        raw = await asyncio.wait_for(client.recv(), timeout=0.3)
+                    except asyncio.TimeoutError:
+                        continue
+                    msg = json.loads(raw)
+                    if msg.get("type") != "ranging":
+                        continue
+                    if msg.get("rangingEvent") is not None:
+                        saw_event = True
+                    elif saw_event:
+                        saw_clear = True
+                assert saw_event, "rangingEvent never appeared in a broadcast"
+                assert saw_clear, "rangingEvent was never cleared on a follow-up"
+        finally:
+            await stop()
+            for s in (srv_a, srv_b):
+                s.close()
+                await s.wait_closed()
+
+    run(inner())
+
+
+def test_ranging_message_envelope_shape():
+    """A dashboard client receives the locked RangingMessage schema once a
+    contest fires."""
+
+    async def inner():
+        url_a, push_a, srv_a = await _start_peer("SIM-A", -60.0)
+        url_b, push_b, srv_b = await _start_peer("SIM-B", -60.0)
+        agg, port, stop = await _start_aggregator_with_ranging(
+            [url_a, url_b],
+            tick_ms=50,
+            ranging_source=_make_source({"SIM-A": 1.5, "SIM-B": 2.5}),
+        )
+
+        try:
+            await _drain_peer_connections(agg, 2)
+            for _ in range(8):
+                await push_a(_reading("SIM-A", -60.0))
+                await push_b(_reading("SIM-B", -60.0))
+                await asyncio.sleep(0.02)
+
+            async with websockets.connect(f"ws://127.0.0.1:{port}") as client:
+                saw_ranging = False
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 3.0
+                while loop.time() < deadline and not saw_ranging:
+                    try:
+                        raw = await asyncio.wait_for(client.recv(), timeout=0.3)
+                    except asyncio.TimeoutError:
+                        continue
+                    msg = json.loads(raw)
+                    if msg.get("type") != "ranging":
+                        continue
+                    saw_ranging = True
+                    assert set(msg.keys()) == {
+                        "type", "contest", "chirp", "fusionReason", "rangingEvent"
+                    }
+                    assert msg["contest"] is not None
+                    assert set(msg["contest"].keys()) == {
+                        "incumbentId", "challengerId", "incumbentRssi",
+                        "challengerRssi", "atTick",
+                    }
+                    assert msg["chirp"] is not None
+                    assert set(msg["chirp"].keys()) == {
+                        "measurements", "winnerId", "sameRoom", "resolvedTick",
+                    }
+                    for m in msg["chirp"]["measurements"]:
+                        assert set(m.keys()) == {"scannerId", "tofUs", "distanceM"}
+                    assert msg["fusionReason"] in {
+                        "ble-only", "chirp-confirmed", "chirp-resolved-tie",
+                        "chirp-room-containment",
+                    }
+                assert saw_ranging, "never received a ranging broadcast"
+        finally:
+            await stop()
+            for s in (srv_a, srv_b):
+                s.close()
+                await s.wait_closed()
+
+    run(inner())
+
+
+def _make_source(distances):
+    """Build a deterministic ranging source that reads from a fixed distance
+    map. Returns the callable expected by Aggregator.__init__."""
+    from ranging import chirp_from_measurements, tof_to_distance, ChirpMeasurement
+
+    def source(contest, tick):
+        measurements = []
+        for scanner_id in (contest.incumbent_id, contest.challenger_id):
+            d = distances.get(scanner_id)
+            if d is None:
+                continue
+            measurements.append(
+                ChirpMeasurement(
+                    scanner_id=scanner_id,
+                    tof_us=(d / 343.0) * 1_000_000.0,
+                    distance_m=d,
+                )
+            )
+        return chirp_from_measurements(tuple(measurements), contest, tick)
+
+    return source
