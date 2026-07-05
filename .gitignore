@@ -6,6 +6,8 @@ aether-dashboard/tsconfig.tsbuildinfo
 aether-bridge/.venv/
 aether-bridge/.pip-cache/
 aether-bridge/__pycache__/
+aether-bridge/**/__pycache__/
+aether-bridge/.pytest_cache/
 
 .claude/
 
