@@ -242,15 +242,146 @@ Once the beacon reappears (screen unlocked, back in range), the dashboard will r
 }
 ```
 
+## Multi-device mesh (Phase 2)
+
+Phase 2 generalizes the single-scanner bridge into a **federated mesh**: each scanner exposes its own WebSocket server, and a central aggregator connects out to each one, fuses readings, and runs leader election on a fixed tick. No scanner needs to know about any other scanner directly — the aggregator is the only fusion point.
+
+Three modules implement the mesh (none imports `bleak`; the mesh layer is BLE-agnostic):
+
+- **`aggregator.py`** — connects out as a WebSocket *client* to each peer scanner URL, maintains the latest reading per scanner, runs `election.py` every tick (default 400 ms), and serves its own endpoint at `ws://127.0.0.1:8766` broadcasting the election state. Also accepts wake triggers (terminal spacebar/enter, or inbound WS `{type:"wake"}`).
+- **`election.py`** — pure, I/O-free leader-election logic. A challenger must beat the incumbent's smoothed RSSI by **5 dBm for 2 consecutive ticks** before ownership transfers (same hysteresis pattern as the single-scanner dashboard). Exact ties broken by lexically smaller scanner id. Per-scanner `calibration_offset` cancels radio miscalibration.
+- **`simulated_scanner.py`** — hardware-free scanner exposing the same WS contract as `bridge.py`, so the mesh can be demoed and tested end-to-end with no BLE radio.
+
+### Per-scanner calibration offset
+
+Different BLE radios/antennas report RSSI with systematic bias. A scanner that over-reports by even a few dB will steal ownership from a truly-closer scanner on raw comparison alone. The aggregator accepts an inline per-peer offset on the `--peers` flag:
+
+```
+--peers ws://127.0.0.1:9001,ws://127.0.0.1:9002=-5.0
+```
+
+The offset (dB, additive) cancels the bias — see the "kill-test" cases in `tests/test_election.py`, which prove ownership is wrong without correction and correct with it. Bare URLs default to offset 0.0.
+
+### One-click mesh demo (no hardware)
+
+From the repo root:
+
+```
+AetherMesh.bat
+```
+
+Starts two simulated scanners (SIM-A walks close → far while SIM-B walks far → close) plus the aggregator and dashboard, in split panes. Toggle **Source → Mesh** in the dashboard header; the owner spotlight hands off around the 15 s mark.
+
+### Manual mesh startup
+
+```powershell
+# Terminal 1 - simulated scanner A (port 9001)
+.venv\Scripts\python.exe simulated_scanner.py --scanner SIM-A --port 9001 --base-rssi -55
+
+# Terminal 2 - simulated scanner B (port 9002)
+.venv\Scripts\python.exe simulated_scanner.py --scanner SIM-B --port 9002 --base-rssi -70
+
+# Terminal 3 - aggregator (connects to both, serves :8766)
+.venv\Scripts\python.exe aggregator.py --peers ws://127.0.0.1:9001,ws://127.0.0.1:9002
+
+# Terminal 4 - dashboard
+cd ..\aether-dashboard
+npm.cmd run dev
+# open http://localhost:3000 and toggle Source -> Mesh
+```
+
+To mix real and simulated scanners, replace either peer URL with a real `bridge.py` instance (its default port is 8765 — pass `--port` and `--scanner` to identify it).
+
+### Election message format (locked schema)
+
+Broadcast on every tick from `ws://127.0.0.1:8766`:
+
+```json
+{
+  "type": "election",
+  "owner": "SIM-A",
+  "tick": 4831,
+  "ts": "14:32:41",
+  "scanners": [
+    {"id": "SIM-A", "rssi": -58.2, "smoothedRssi": -59.1, "lastSeenMs": 340, "present": true},
+    {"id": "SIM-B", "rssi": null, "smoothedRssi": null, "lastSeenMs": null, "present": false}
+  ],
+  "lastHandoff": {"from": "SIM-B", "to": "SIM-A", "atTick": 4821, "ts": "14:32:15"},
+  "wakeOutcome": null
+}
+```
+
+`wakeOutcome` is one-shot — present on exactly the broadcast following a wake trigger, then `null` again. Its shape when present:
+
+```json
+{"requestedAtTick": 4830, "ts": "14:32:41", "owner": "SIM-A",
+ "results": [{"id": "SIM-A", "outcome": "ACCEPTED"},
+             {"id": "SIM-B", "outcome": "SUPPRESSED"}]}
+```
+
+### CLI flags
+
+#### `aggregator.py`
+
+```
+--peers URLS    Comma-separated peer scanner URLs, optionally ws://host:port=offset (required)
+--host TEXT     WebSocket bind host for this aggregator's own server (default: 127.0.0.1)
+--port INT      WebSocket bind port for this aggregator's own server (default: 8766)
+--tick-ms INT   Election tick interval in milliseconds (default: 400)
+```
+
+Examples:
+
+```powershell
+# Two peers, no calibration
+python.exe aggregator.py --peers ws://127.0.0.1:9001,ws://127.0.0.1:9002
+
+# Cancel SIM-B's +5dB radio over-report bias
+python.exe aggregator.py --peers ws://127.0.0.1:9001,ws://127.0.0.1:9002=-5.0
+```
+
+#### `simulated_scanner.py`
+
+```
+--scanner TEXT  Identifier for this simulated scanner (default: SIM-A)
+--name TEXT     Simulated target BLE local name (default: OnePlus 7T)
+--host TEXT     WebSocket bind host (default: 127.0.0.1)
+--port INT      WebSocket bind port (default: 9001)
+--base-rssi F   Baseline simulated RSSI in dBm (default: -60.0)
+--noise F       Uniform +/- noise in dB per sample (default: 2.0)
+--script TEXT   Optional ramp: 'rssi@seconds,rssi@seconds,...' - linearly ramps base
+                RSSI through each segment in order, then holds the final value
+--lost-after F  Go silent / emit 'lost' after this many seconds
+--seed INT      Seed the RNG for reproducible noise
+```
+
+Examples:
+
+```powershell
+# Static -60 dBm with 2 dB noise
+python.exe simulated_scanner.py --scanner SIM-A --port 9001 --base-rssi -60
+
+# Ramp from -50 to -70 over 15s, then back to -50 over 15s
+python.exe simulated_scanner.py --scanner SIM-B --port 9002 --script "-70@15,-50@15,-70@15"
+```
+
+### Tests
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests\ -v
+```
+
+24 tests total: 12 covering pure election logic (`test_election.py`, including the two cross-source "kill-tests"), plus 12 end-to-end tests driving a real aggregator against in-process mock peer servers (`test_aggregator.py`).
+
 ## Stopping the bridge
 
-Press **Ctrl+C** in the terminal. The bridge will:
+Press **Ctrl+C** in the terminal. The bridge (and aggregator / simulated scanner) will:
 
-1. Cancel all scanning tasks
+1. Cancel all scanning / election / broadcast tasks
 2. Close all WebSocket connections
-3. Shut down the server
+3. Shut down the server(s)
 4. Exit cleanly
 
 ## Next steps
 
-Once hardware verification is complete (phone runs nRF Connect, diag.py and bridge.py both work, dashboard shows live RSSI and ownership), the next phase is multi-device mesh and leader election.
+Phase 2 (multi-device mesh + leader election) is now complete — see the [Multi-device mesh](#multi-device-mesh-phase-2) section above. The next phase is portable conversation state: the assistant finishes its sentence on the next device as ownership hands off.

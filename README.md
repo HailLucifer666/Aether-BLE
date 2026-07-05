@@ -10,7 +10,7 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![BLE](https://img.shields.io/badge/Bluetooth-LE-0082FC?logo=bluetooth&logoColor=white)
-![Status](https://img.shields.io/badge/Phase%201-hardware%20verified-brightgreen)
+![Status](https://img.shields.io/badge/Phase%203-portable%20conversation-purple)
 
 [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Why hysteresis](#-why-hysteresis-matters) · [Roadmap](#-roadmap) · [Project structure](#-project-structure)
 
@@ -60,6 +60,63 @@ flowchart LR
 ```
 
 Nothing here is simulated when running in **Live BLE** mode — real radio, real signal strength, real ownership handoffs. A separate **Simulation** mode (Phase 0) reproduces the same arbitration logic with a scripted room-walk, for demoing without hardware.
+
+## 🕸️ Multi-device mesh (Phase 2)
+
+Phase 2 extends a single scanner into a **federated mesh**: each scanner (a real `bridge.py` instance or a hardware-free `simulated_scanner.py`) exposes its own WebSocket server, and a central `aggregator.py` connects out to each one, fuses their readings, and runs leader election on a 400 ms tick. The conversation is "owned" by exactly one scanner at a time, and ownership hands off as the user moves — exactly the cell-tower-roaming model, no cloud involved.
+
+```mermaid
+flowchart LR
+    subgraph Scanners["📡 Scanners (real or simulated)"]
+        S1["bridge.py / sim\nws://127.0.0.1:9001"]
+        S2["bridge.py / sim\nws://127.0.0.1:9002"]
+    end
+
+    subgraph Agg["🧠 Aggregator"]
+        Fusion["fuse readings\n+ per-scanner offset"]
+        Election["election.py\nhysteresis leader election"]
+        WS2["ws://127.0.0.1:8766"]
+    end
+
+    subgraph Browser2["🌐 Dashboard (Mesh mode)"]
+        Owner["Owner spotlight\n+ ranked scanners"]
+        Wake["Wake button\n(owner ACCEPTED, rest SUPPRESSED)"]
+    end
+
+    S1 --> Fusion
+    S2 --> Fusion
+    Fusion --> Election --> WS2
+    WS2 -- "JSON: election" --> Owner
+    Wake -.->|"JSON: wake"| WS2
+```
+
+**The same hysteresis rule** (challenger must beat the incumbent by 5 dBm for 2 consecutive ticks) prevents flapping between scanners. A per-scanner `calibration_offset` (passed inline on the `--peers` flag) cancels radio miscalibration so a scanner that over-reports RSSI can't steal ownership from a truly-closer scanner — see the "kill-test" cases in `aether-bridge/tests/test_election.py`.
+
+**One-click demo (no hardware):**
+
+```
+AetherMesh.bat
+```
+
+Starts two simulated scanners that walk past each other (SIM-A close → far while SIM-B far → close) plus the aggregator and dashboard, in split panes. Toggle **Source → Mesh** in the dashboard header and watch the owner spotlight hand off around the 15 s mark. See `aether-bridge/README.md` for the CLI flags and wire schema.
+
+## 💬 Portable conversation state (Phase 3)
+
+The conversation itself becomes a portable object. Type a message in the **Conversation** panel; the aggregator generates real speech with `edge-tts` (Microsoft neural voices, **free, no API key**) and the current owner "speaks" it. If ownership hands off mid-sentence, a four-phase contract migrates the utterance to the new owner — the assistant literally finishes its sentence on the next device.
+
+```
+User types "Hello, I am Aether"
+  → owner SIM-A speaks the sentence (audio plays, sound-wave anim on SIM-A's card)
+
+User walks → ownership hands off SIM-A → SIM-B mid-sentence
+  → PREPARE (200ms) → TRANSFER (200ms, audio PAUSES at the current word)
+  → CONFIRM (200ms, speaking flips to SIM-B) → RELEASE (200ms, audio RESUMES from the same word)
+  → sentence continues under SIM-B — the migration is audible
+```
+
+The ~400 ms pause during TRANSFER/CONFIRM is the visceral "the sentence moved" moment. If `edge-tts` is missing or the network is down, a synthetic fallback keeps the migration demo working visually (with a "TTS offline — simulating" badge); the FSM and handoff contract are identical either way.
+
+**Try it:** run `AetherMesh.bat`, toggle Source → Mesh, type a longish sentence (e.g. *"The quick brown fox jumps over the lazy dog"*), and watch/listen as the simulated scanners walk past each other ~15 s later.
 
 ## ⚖️ Why hysteresis matters
 
@@ -112,8 +169,8 @@ Toggle **Source: Simulation → Live BLE** in the dashboard header once the brid
 flowchart TD
     P0["✅ Phase 0 — Simulated dashboard\nNaive vs Hysteresis demo"]
     P1["✅ Phase 1 — Real BLE bridge\nhardware-verified"]
-    P2["◻ Phase 2 — Multi-device mesh\nleader election"]
-    P3["◻ Phase 3 — Portable conversation\ntwo-phase handoff"]
+    P2["✅ Phase 2 — Multi-device mesh\nleader election, wake suppression"]
+    P3["✅ Phase 3 — Portable conversation\nfour-phase handoff, edge-tts audio"]
     P4["◻ Phase 4 — Tiered sensing\nBLE + near-ultrasound tie-break"]
     P5["◻ Phase 5 — Open protocol spec"]
 
@@ -121,14 +178,16 @@ flowchart TD
 
     style P0 fill:#0891b2,color:#fff
     style P1 fill:#0891b2,color:#fff
+    style P2 fill:#0891b2,color:#fff
+    style P3 fill:#0891b2,color:#fff
 ```
 
 | Phase | Status |
 |---|---|
 | 0 — Simulated dashboard | ✅ Done |
 | 1 — Real BLE bridge | ✅ Code complete, hardware-verified live |
-| 2 — Multi-device mesh | ◻ Not started |
-| 3 — Portable conversation state | ◻ Not started |
+| 2 — Multi-device mesh | ✅ Build 2: aggregator + election + mesh UI, calibration wired, 24 tests green |
+| 3 — Portable conversation state | ✅ Build 1: edge-tts audio, four-phase handoff FSM, conversation UI, 50 tests green |
 | 4 — BLE + near-ultrasound tiered sensing | ◻ Not started |
 | 5 — Open protocol spec | ◻ Not started |
 
@@ -136,17 +195,24 @@ flowchart TD
 
 ```
 Aether-BLE/
-├── Aether.bat              ← one-click launcher (Windows Terminal, 3-pane split)
+├── Aether.bat              ← one-click single-scanner demo (BLE bridge + dashboard)
+├── AetherMesh.bat          ← one-click Phase 2 mesh demo (2 simulated scanners + aggregator + dashboard)
 ├── Aether.md               ← architecture plan, gap analysis, full roadmap
 ├── AETHER_SPEC.md           ← original Phase 0 AI-generation spec
 ├── HANDOFF.md               ← project history / research handoff notes
 ├── CHANGELOG.md
 ├── aether-dashboard/         ← Next.js + React + TypeScript, single-file UI
-│   └── src/app/page.tsx      ← all dashboard logic: simulation + Live BLE
-└── aether-bridge/            ← Python BLE scanner -> WebSocket bridge
+│   └── src/app/page.tsx      ← dashboard: simulation + Live BLE + Mesh
+└── aether-bridge/            ← Python BLE scanner -> WebSocket bridge + mesh aggregator
+    ├── bridge.py              ← the real-time scanner + server (Phase 1)
     ├── diag.py                ← two-part hardware diagnostic gate
-    ├── bridge.py              ← the real-time scanner + server
-    └── README.md              ← bridge setup, nRF Connect checklist, troubleshooting
+    ├── aggregator.py          ← Phase 2/3 mesh aggregator + leader election + conversation FSM (serves :8766)
+    ├── election.py            ← pure leader-election logic (hysteresis + tie-break)
+    ├── conversation.py        ← pure conversation FSM logic (Phase 3 four-phase handoff)
+    ├── simulated_scanner.py   ← hardware-free scanner for mesh demos/tests
+    ├── messages.py            ← locked wire schema (reading / lost / election / conversation)
+    ├── smoothing.py           ← EMA RSSI smoothing
+    └── tests/                 ← pytest: election + aggregator + conversation (50 tests)
 ```
 
 ## 🧱 Tech stack
@@ -159,4 +225,4 @@ Aether-BLE/
 
 ## License
 
-Not yet chosen — tracked as an open item. Contributions/discussion welcome in the meantime.
+Apache License 2.0 — see [LICENSE](LICENSE).

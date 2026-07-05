@@ -14,19 +14,19 @@ import json
 import signal
 import sys
 from dataclasses import dataclass
-from datetime import datetime
 
 import websockets
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
+from messages import build_lost_message, build_reading_message
+from smoothing import apply_ema
+
 DEFAULT_TARGET_NAME = "OnePlus 7T"
 DEFAULT_SCANNER_ID = "PC"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-
-EMA_ALPHA = 0.3
 
 # Windows' WinRT BLE scanning stack uses a hardcoded ~118ms scan interval with
 # an ~18ms scan window (~15% duty cycle) that no application can adjust, and
@@ -61,10 +61,6 @@ BAR_MIN_RSSI = -100
 BAR_MAX_RSSI = -30
 
 
-def _now_hms() -> str:
-    return datetime.now().strftime("%H:%M:%S")
-
-
 def _raw_name(device: BLEDevice, adv: AdvertisementData) -> str | None:
     if adv.local_name:
         return adv.local_name
@@ -85,39 +81,6 @@ class BeaconState:
     smoothed_rssi: float | None = None
     last_seen_monotonic: float | None = None
     is_lost: bool = False
-
-
-def apply_ema(previous_smoothed: float | None, raw: float, alpha: float = EMA_ALPHA) -> float:
-    """Exponential moving average: smoothed = alpha*raw + (1-alpha)*prev.
-
-    On the first sample (no previous value) the smoothed value equals raw.
-    """
-    if previous_smoothed is None:
-        return raw
-    return alpha * raw + (1 - alpha) * previous_smoothed
-
-
-def build_reading_message(
-    scanner: str, name: str, raw_rssi: float, smoothed_rssi: float, last_seen_ms: int
-) -> dict:
-    return {
-        "type": "reading",
-        "scanner": scanner,
-        "name": name,
-        "rssi": raw_rssi,
-        "smoothedRssi": smoothed_rssi,
-        "lastSeenMs": last_seen_ms,
-        "ts": _now_hms(),
-    }
-
-
-def build_lost_message(scanner: str, name: str) -> dict:
-    return {
-        "type": "lost",
-        "scanner": scanner,
-        "name": name,
-        "ts": _now_hms(),
-    }
 
 
 def render_terminal_line(

@@ -37,10 +37,18 @@ Click **Run Simulation** to auto-walk the room (Phone → Speaker → back → P
 |---|---|---|
 | 0 | This visual simulator | ✅ complete |
 | 1 | Real BLE: phone advertises (nRF Connect), Windows scans via `bleak`, live dashboard over WebSocket | built, pending hardware verification |
-| 2 | Multi-device mesh, leader election, wake-word suppression on losing devices | planned |
+| 2 | Multi-device mesh, leader election, wake-word suppression on losing devices | ✅ in progress — `src/app/mesh/` viewer live |
 | 3 | Conversation state migrates on handoff — the assistant finishes its sentence on the next device | planned |
 | 4 | Tiered sensing: BLE always-on + near-ultrasound (18–21 kHz) chirp tie-breaker for contested elections | planned |
 | 5 | Open protocol spec | planned |
+
+## Data-source modes
+
+The dashboard header cycles through three live data sources:
+
+- **Simulation** (Phase 0) — client-side fake RSSI physics, no hardware.
+- **Live BLE** (Phase 1) — single real beacon over `ws://127.0.0.1:8765` (see `aether-bridge/bridge.py`).
+- **Mesh** (Phase 2) — read-only multi-scanner election viewer over `ws://127.0.0.1:8766` (see `src/app/mesh/` and `aether-bridge/aggregator.py`). Renders the current owner, a ranked per-scanner signal list, a server-driven handoff log, and a Wake button (the dashboard's only outbound message). Never arbitrates ownership locally — every field comes straight from the aggregator's `election` broadcast.
 
 ## Stack
 

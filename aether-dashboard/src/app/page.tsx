@@ -14,6 +14,9 @@ import {
   Wifi,
   type LucideIcon,
 } from "lucide-react";
+import MeshView from "./mesh/MeshView";
+import { useElectionSocket } from "./mesh/useElectionSocket";
+import { getBars } from "@/lib/rssi";
 
 interface Device {
   name: string;
@@ -31,7 +34,20 @@ interface HandoffEvent {
   time: string; // HH:MM:SS
 }
 
-type DataSource = "simulation" | "live";
+type DataSource = "simulation" | "live" | "mesh";
+
+/** Source toggle cycles simulation -> live -> mesh -> simulation. */
+const DATA_SOURCE_CYCLE: Record<DataSource, DataSource> = {
+  simulation: "live",
+  live: "mesh",
+  mesh: "simulation",
+};
+
+const DATA_SOURCE_LABEL: Record<DataSource, string> = {
+  simulation: "Simulation",
+  live: "Live BLE",
+  mesh: "Mesh",
+};
 
 type LiveConnectionState = "connecting" | "live" | "offline" | "beacon-lost";
 
@@ -82,8 +98,6 @@ const DEVICES: readonly Device[] = [
 ];
 
 const SIM_DEVICE_NAMES: readonly string[] = DEVICES.map((d) => d.name);
-const LIVE_BEACON_NAME = "LiveBeacon";
-const LIVE_CANDIDATE_NAMES: readonly string[] = [LIVE_BEACON_NAME];
 
 const ICONS: Record<string, LucideIcon> = {
   monitor: Monitor,
@@ -121,10 +135,6 @@ function calculateRssi(device: Device, userPos: number): number {
   return device.baseRssi - distance * 6 + noise;
 }
 
-function getBars(rssi: number): number {
-  return Math.max(0, Math.min(5, Math.floor((rssi + 90) / 8)));
-}
-
 function toPercent(position: number): number {
   return ((position - MAP_MIN) / (MAP_MAX - MAP_MIN)) * 100;
 }
@@ -142,6 +152,7 @@ export default function Dashboard() {
   const [readings, setReadings] = useState<Record<string, number>>({});
 
   const [dataSource, setDataSource] = useState<DataSource>("simulation");
+  const meshSocket = useElectionSocket(dataSource === "mesh");
   const [liveConnection, setLiveConnection] = useState<LiveConnectionState>("connecting");
   const [liveSmoothedRssi, setLiveSmoothedRssi] = useState<number | null>(null);
   const [liveRawRssi, setLiveRawRssi] = useState<number | null>(null);
@@ -176,19 +187,7 @@ export default function Dashboard() {
   const wsRetryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const arbitrate = useCallback(
-    (rssiByDevice: Record<string, number>, candidateNames: readonly string[] = SIM_DEVICE_NAMES, beaconPresent?: boolean) => {
-      // Live-BLE-only release path: when the single real beacon is absent/lost,
-      // explicitly clear ownership. Simulation mode never passes `beaconPresent`
-      // (always undefined there), so this branch is unreachable from Simulation.
-      if (beaconPresent === false) {
-        if (activeRef.current !== null) {
-          activeRef.current = null;
-          setActiveDevice(null);
-        }
-        challengerRef.current = { name: null, streak: 0 };
-        return;
-      }
-
+    (rssiByDevice: Record<string, number>, candidateNames: readonly string[] = SIM_DEVICE_NAMES) => {
       const best = candidateNames.reduce((a, b) =>
         rssiByDevice[b] > rssiByDevice[a] ? b : a
       );
@@ -343,15 +342,13 @@ export default function Dashboard() {
     const signalPresent = msg.smoothedRssi >= LIVE_PRESENCE_RSSI_THRESHOLD;
     const beaconPresent = resolveBeaconPresence(signalPresent);
     setLiveConnection(beaconPresent ? "live" : "beacon-lost");
-    arbitrate({ [LIVE_BEACON_NAME]: msg.smoothedRssi }, LIVE_CANDIDATE_NAMES, beaconPresent);
-  }, [arbitrate, resolveBeaconPresence]);
+  }, [resolveBeaconPresence]);
 
   const handleLiveLost = useCallback((msg: LiveLostMessage) => {
     setLiveLastTs(msg.ts);
     const beaconPresent = resolveBeaconPresence(false);
     setLiveConnection(beaconPresent ? "live" : "beacon-lost");
-    arbitrate({}, LIVE_CANDIDATE_NAMES, beaconPresent);
-  }, [arbitrate, resolveBeaconPresence]);
+  }, [resolveBeaconPresence]);
 
   // Live BLE WebSocket connection: connect while in "live" mode, retry every
   // 2s on close/error, tear down cleanly when leaving live mode.
@@ -428,7 +425,7 @@ export default function Dashboard() {
   const toggleDataSource = useCallback(() => {
     if (isSimulating) return;
     setDataSource((prev) => {
-      const next = prev === "simulation" ? "live" : "simulation";
+      const next = DATA_SOURCE_CYCLE[prev];
       // Reset ownership state on every switch so neither mode ever starts
       // with a stale activeDevice left over from the other mode.
       activeRef.current = null;
@@ -486,12 +483,14 @@ export default function Dashboard() {
               className={`flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                 dataSource === "live"
                   ? "border-amber-500/60 bg-amber-500/10 text-amber-300"
-                  : "border-slate-700 bg-slate-900 text-slate-400"
+                  : dataSource === "mesh"
+                    ? "border-cyan-500/60 bg-cyan-500/10 text-cyan-300"
+                    : "border-slate-700 bg-slate-900 text-slate-400"
               }`}
-              title="Switch between the fake 3-device simulation and a live BLE beacon over WebSocket."
+              title="Cycle between the fake 3-device simulation, a live BLE beacon over WebSocket, and the read-only mesh election viewer."
             >
               <Wifi className="h-4 w-4" />
-              Source: {dataSource === "live" ? "Live BLE" : "Simulation"}
+              Source: {DATA_SOURCE_LABEL[dataSource]}
             </button>
             {dataSource === "simulation" && (
               <button
@@ -652,7 +651,6 @@ export default function Dashboard() {
             liveRawRssi={liveRawRssi}
             liveLastTs={liveLastTs}
             sparkline={sparkline}
-            activeDevice={activeDevice}
             calibratedP0={calibratedP0}
             isCalibrated={isCalibrated}
             liveDistanceMeters={liveDistanceMeters}
@@ -660,7 +658,12 @@ export default function Dashboard() {
           />
         )}
 
-        {/* HANDOFF LOG */}
+        {dataSource === "mesh" && <MeshView {...meshSocket} />}
+
+        {/* HANDOFF LOG (Simulation + Live BLE only — Mesh mode has its own
+            cross-node handoff log inside MeshView, sourced from the
+            aggregator's lastHandoff rather than this client-side log) */}
+        {dataSource !== "mesh" && (
         <section className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
           <div className="mb-4 flex items-center justify-between">
             <h2 className="text-xs font-semibold uppercase tracking-widest text-slate-500">
@@ -695,6 +698,7 @@ export default function Dashboard() {
             </AnimatePresence>
           </div>
         </section>
+        )}
       </div>
     </main>
   );
@@ -769,7 +773,6 @@ interface LiveBleViewProps {
   liveRawRssi: number | null;
   liveLastTs: string | null;
   sparkline: readonly SparklineSample[];
-  activeDevice: string | null;
   calibratedP0: number;
   isCalibrated: boolean;
   liveDistanceMeters: number | null;
@@ -782,14 +785,12 @@ function LiveBleView({
   liveRawRssi,
   liveLastTs,
   sparkline,
-  activeDevice,
   calibratedP0,
   isCalibrated,
   liveDistanceMeters,
   onCalibrate,
 }: LiveBleViewProps) {
   const bars = liveSmoothedRssi !== null ? getBars(liveSmoothedRssi) : 0;
-  const hasOwner = activeDevice !== null;
 
   // Fixed y-axis band (not derived from the current sample window) so the
   // chart doesn't rescale/snap on every render as extreme samples enter or
@@ -852,9 +853,7 @@ function LiveBleView({
               </div>
               <div className="flex-1">
                 <div className="flex items-center justify-between text-sm">
-                  <span className="font-medium text-slate-200">
-                    {hasOwner ? "Active owner" : "No owner"}
-                  </span>
+                  <span className="font-medium text-slate-200">Live Reading</span>
                   <span className="font-mono text-xs text-slate-400">
                     {liveSmoothedRssi !== null ? `${liveSmoothedRssi.toFixed(1)} dBm` : "—"}
                   </span>
