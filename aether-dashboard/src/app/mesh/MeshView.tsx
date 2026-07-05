@@ -1,10 +1,10 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight, Radio, Send, Zap } from "lucide-react";
+import { ArrowRight, Radio, Send, Waves, Zap } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { getBars } from "@/lib/rssi";
-import type { HandoffPhase } from "./types";
+import type { FusionReason, HandoffPhase } from "./types";
 import type { UseElectionSocketResult } from "./useElectionSocket";
 import type { MeshConnectionState } from "./types";
 
@@ -27,6 +27,16 @@ const CONNECTION_PILL_CLASS: Record<MeshConnectionState, string> = {
 // show progress through PREPARE -> TRANSFER -> CONFIRM -> RELEASE.
 const HANDOFF_PHASE_ORDER: HandoffPhase[] = ["PREPARE", "TRANSFER", "CONFIRM", "RELEASE"];
 
+// Human-readable labels for how the latest owner decision was reached. The
+// fusionReason arrives straight from the aggregator's ranging.fuse() and
+// tells the dashboard which tier drove the decision (the Phase 4 value prop).
+const FUSION_REASON_LABEL: Record<FusionReason, string> = {
+  "ble-only": "BLE only",
+  "chirp-confirmed": "Chirp confirmed BLE",
+  "chirp-resolved-tie": "Chirp broke the tie",
+  "chirp-room-containment": "Chirp — wall detected",
+};
+
 type MeshViewProps = UseElectionSocketResult;
 
 export default function MeshView({
@@ -45,10 +55,19 @@ export default function MeshView({
   phaseTo,
   sendSay,
   registerAudioElement,
+  contest,
+  chirp,
+  fusionReason,
+  rangingEvent,
 }: MeshViewProps) {
   const canWake = connection === "live";
   const outcomeById = new Map(wakeOutcome?.results.map((r) => [r.id, r.outcome]) ?? []);
   const isMigrating = handoffPhase !== "IDLE";
+  // Tier-2 escalation is "live" when a contest is active. The chirp ping
+  // animation arms when a fresh rangingEvent arrives and disarms after the
+  // hook's timer clears it.
+  const isContested = contest !== null;
+  const rangingActive = rangingEvent !== null;
 
   return (
     <div className="space-y-6">
@@ -216,11 +235,75 @@ export default function MeshView({
         </div>
       </section>
 
+      {/* TIER-2 RANGING (Phase 4) — only rendered when a contest is live or a
+          chirp resolution is on hand. The panel visualizes the escalation:
+          when two signal bars are within the margin, a near-ultrasound chirp
+          fires (the ping animation) and resolves the tie deterministically. */}
+      <AnimatePresence>
+        {(isContested || chirp !== null) && (
+          <motion.section
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            className="overflow-hidden rounded-xl border border-fuchsia-500/40 bg-fuchsia-500/5 p-5"
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-fuchsia-300">
+                <Waves className="h-3.5 w-3.5" />
+                Tier 2 · Near-Ultrasound
+              </h2>
+              <span className="text-[10px] uppercase tracking-widest text-fuchsia-300/70">
+                {isContested ? "Contested — escalating" : "Resolved"}
+              </span>
+            </div>
+
+            {contest !== null && (
+              <div className="mb-3 flex items-center justify-center gap-4 text-sm">
+                <span className="font-mono text-cyan-300">{contest.incumbentId}</span>
+                <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+                  {contest.incumbentRssi.toFixed(1)} / {contest.challengerRssi.toFixed(1)} dBm
+                </span>
+                <span className="font-mono text-cyan-300">{contest.challengerId}</span>
+              </div>
+            )}
+
+            {/* Chirp ping animation: arms when rangingEvent arrives, shows
+                expanding rings between the contest parties while the chirp
+                "travels". Disarms when the hook's timer clears rangingEvent. */}
+            <ChirpPing armed={rangingActive} />
+
+            {chirp !== null && chirp.winnerId !== null && (
+              <div className="mt-3 flex flex-wrap items-center justify-center gap-2 text-xs">
+                <span className="text-slate-400">Chirp winner:</span>
+                <span className="font-mono font-semibold text-fuchsia-300">{chirp.winnerId}</span>
+                <span className="text-slate-500">
+                  · {Math.min(...chirp.measurements.map((m) => m.distanceM)).toFixed(2)} m ToF
+                </span>
+                {chirp.sameRoom ? (
+                  <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-emerald-300">
+                    Same room
+                  </span>
+                ) : (
+                  <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-300">
+                    Wall detected
+                  </span>
+                )}
+              </div>
+            )}
+          </motion.section>
+        )}
+      </AnimatePresence>
+
       {/* PER-SCANNER RANKED LIST */}
       <section className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
-        <h2 className="mb-4 text-xs font-semibold uppercase tracking-widest text-slate-500">
-          Scanners
-        </h2>
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-xs font-semibold uppercase tracking-widest text-slate-500">
+            Scanners
+          </h2>
+          <span className="text-[10px] uppercase tracking-widest text-slate-500">
+            {FUSION_REASON_LABEL[fusionReason]}
+          </span>
+        </div>
         {scanners.length === 0 ? (
           <p className="py-4 text-center text-sm text-slate-600">
             No scanner data yet — waiting for the aggregator.
@@ -421,6 +504,49 @@ function SpeakingWave() {
         />
       ))}
     </span>
+  );
+}
+
+/** The Phase 4 chirp ping: concentric expanding rings centered between the
+ * contest parties. Arms when a rangingEvent arrives (a fresh chirp fired),
+ * idles otherwise. The animation conveys the on-demand tier-2 escalation —
+ * the visual answer to "why did a chirp just fire?" */
+function ChirpPing({ armed }: { armed: boolean }) {
+  return (
+    <div className="relative flex h-12 items-center justify-center" aria-label="chirp">
+      <AnimatePresence>
+        {armed && (
+          <>
+            {[0, 1, 2].map((i) => (
+              <motion.span
+                key={i}
+                className="absolute h-8 w-8 rounded-full border border-fuchsia-400"
+                initial={{ scale: 0.4, opacity: 0.9 }}
+                animate={{ scale: 2.4, opacity: 0 }}
+                exit={{ opacity: 0 }}
+                transition={{
+                  duration: 1.4,
+                  repeat: Infinity,
+                  ease: "easeOut",
+                  delay: i * 0.35,
+                }}
+              />
+            ))}
+            <motion.span
+              className="rounded-full bg-fuchsia-400"
+              animate={{ scale: [1, 1.3, 1] }}
+              transition={{ duration: 0.7, repeat: Infinity, ease: "easeInOut" }}
+              style={{ height: 8, width: 8 }}
+            />
+          </>
+        )}
+      </AnimatePresence>
+      {!armed && (
+        <span className="text-[10px] uppercase tracking-widest text-slate-600">
+          Listening…
+        </span>
+      )}
+    </div>
   );
 }
 

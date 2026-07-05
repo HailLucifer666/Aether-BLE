@@ -2,12 +2,17 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  ChirpInfo,
+  ContestInfo,
   ConversationMessage,
   ConversationUtterance,
   ElectionMessage,
+  FusionReason,
   HandoffPhase,
   MeshConnectionState,
   MeshHandoffLogEntry,
+  RangingEvent,
+  RangingMessage,
   ScannerEntry,
   TranscriptEntry,
   WakeOutcome,
@@ -17,6 +22,10 @@ const MESH_WS_URL = "ws://127.0.0.1:8766";
 const MESH_RETRY_MS = 2000;
 const MAX_MESH_LOG_ENTRIES = 20;
 const WAKE_OUTCOME_DISPLAY_MS = 5000;
+// How long the Phase 4 chirp-ping animation stays "armed" after a ranging
+// event arrives. Matches roughly one chirp round-trip in the dashboard's
+// perception; the next chirp re-arms it.
+const RANGING_EVENT_DISPLAY_MS = 2500;
 
 export interface UseElectionSocketResult {
   connection: MeshConnectionState;
@@ -37,6 +46,14 @@ export interface UseElectionSocketResult {
   /** MeshView calls this with its hidden <audio> element so the hook can
    * drive playback (load, play, pause-on-TRANSFER, resume-on-RELEASE). */
   registerAudioElement: (el: HTMLAudioElement | null) => void;
+  // Phase 4: tiered ranging. contest is non-null while a photo-finish is
+  // live; chirp is the most-recent chirp resolution; fusionReason labels
+  // how the latest owner decision was reached; rangingEvent fires the
+  // one-shot "chirp ping" animation when a fresh chirp arrives.
+  contest: ContestInfo | null;
+  chirp: ChirpInfo | null;
+  fusionReason: FusionReason;
+  rangingEvent: RangingEvent | null;
 }
 
 function randomRequestId(): string {
@@ -70,6 +87,15 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
   const [handoffPhase, setHandoffPhase] = useState<HandoffPhase>("IDLE");
   const [phaseFrom, setPhaseFrom] = useState<string | null>(null);
   const [phaseTo, setPhaseTo] = useState<string | null>(null);
+
+  // Phase 4 ranging state. rangingEvent is one-shot: set when a fresh chirp
+  // arrives, auto-cleared after a short display window so the ping animation
+  // plays once per chirp round.
+  const [contest, setContest] = useState<ContestInfo | null>(null);
+  const [chirp, setChirp] = useState<ChirpInfo | null>(null);
+  const [fusionReason, setFusionReason] = useState<FusionReason>("ble-only");
+  const [rangingEvent, setRangingEvent] = useState<RangingEvent | null>(null);
+  const rangingEventTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -184,6 +210,28 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
     }
   }, []);
 
+  const handleRangingMessage = useCallback((msg: RangingMessage) => {
+    setContest(msg.contest);
+    setChirp(msg.chirp);
+    setFusionReason(msg.fusionReason);
+
+    // One-shot rangingEvent: latch it on arrival, auto-clear after a short
+    // window so the chirp-ping animation plays once per chirp round. The
+    // server already sends it on exactly one broadcast; this timer is a
+    // belt-and-braces guarantee the UI doesn't get stuck mid-animation if a
+    // later ranging broadcast happens to arrive before the next real chirp.
+    if (msg.rangingEvent !== null) {
+      setRangingEvent(msg.rangingEvent);
+      if (rangingEventTimerRef.current !== null) {
+        clearTimeout(rangingEventTimerRef.current);
+      }
+      rangingEventTimerRef.current = setTimeout(() => {
+        setRangingEvent(null);
+        rangingEventTimerRef.current = null;
+      }, RANGING_EVENT_DISPLAY_MS);
+    }
+  }, []);
+
   useEffect(() => {
     if (!enabled) {
       if (retryTimerRef.current !== null) {
@@ -212,9 +260,12 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
 
       socket.onmessage = (event) => {
         if (cancelled) return;
-        let parsed: ElectionMessage | ConversationMessage;
+        let parsed: ElectionMessage | ConversationMessage | RangingMessage;
         try {
-          parsed = JSON.parse(event.data as string) as ElectionMessage | ConversationMessage;
+          parsed = JSON.parse(event.data as string) as
+            | ElectionMessage
+            | ConversationMessage
+            | RangingMessage;
         } catch {
           return;
         }
@@ -222,6 +273,8 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
           handleElectionMessage(parsed);
         } else if (parsed.type === "conversation") {
           handleConversationMessage(parsed);
+        } else if (parsed.type === "ranging") {
+          handleRangingMessage(parsed);
         }
       };
 
@@ -252,7 +305,7 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
         wsRef.current = null;
       }
     };
-  }, [enabled, handleElectionMessage, handleConversationMessage]);
+  }, [enabled, handleElectionMessage, handleConversationMessage, handleRangingMessage]);
 
   // Reset all mesh-derived state whenever the socket is disabled, so
   // switching away and back to Mesh mode never shows stale data from a
@@ -272,6 +325,11 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
     setHandoffPhase("IDLE");
     setPhaseFrom(null);
     setPhaseTo(null);
+    // Phase 4 resets.
+    setContest(null);
+    setChirp(null);
+    setFusionReason("ble-only");
+    setRangingEvent(null);
     lastLoggedHandoffTickRef.current = null;
     loadedAudioSrcRef.current = null;
     resumeOffsetRef.current = 0;
@@ -283,12 +341,19 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
       clearTimeout(wakeOutcomeTimerRef.current);
       wakeOutcomeTimerRef.current = null;
     }
+    if (rangingEventTimerRef.current !== null) {
+      clearTimeout(rangingEventTimerRef.current);
+      rangingEventTimerRef.current = null;
+    }
   }, [enabled]);
 
   useEffect(() => {
     return () => {
       if (wakeOutcomeTimerRef.current !== null) {
         clearTimeout(wakeOutcomeTimerRef.current);
+      }
+      if (rangingEventTimerRef.current !== null) {
+        clearTimeout(rangingEventTimerRef.current);
       }
     };
   }, []);
@@ -323,5 +388,9 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
     phaseTo,
     sendSay,
     registerAudioElement,
+    contest,
+    chirp,
+    fusionReason,
+    rangingEvent,
   };
 }

@@ -112,3 +112,70 @@ export interface SayMessage {
   text: string;
   requestId: string;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 — tiered sensing: BLE + near-ultrasound chirp tie-breaker.
+//
+// Added as a new message type alongside ElectionMessage/ConversationMessage;
+// the existing contracts stay frozen and untouched. The dashboard dispatches
+// inbound messages by `type` in useElectionSocket. A "ranging" message is
+// only broadcast when tier 2 has been invoked (a contested election), so the
+// wire stays quiet in the common uncontested case.
+// ---------------------------------------------------------------------------
+
+/** Machine-readable tag describing how the latest owner decision was reached. */
+export type FusionReason =
+  | "ble-only"
+  | "chirp-confirmed"
+  | "chirp-resolved-tie"
+  | "chirp-room-containment";
+
+export interface ContestInfo {
+  incumbentId: string;
+  challengerId: string;
+  incumbentRssi: number;
+  challengerRssi: number;
+  atTick: number;
+}
+
+export interface ChirpMeasurement {
+  scannerId: string;
+  /** One-way time-of-flight in microseconds. */
+  tofUs: number;
+  /** tofUs converted to meters via the speed of sound. */
+  distanceM: number;
+}
+
+export interface ChirpInfo {
+  measurements: ChirpMeasurement[];
+  /** Closest device among those that heard the chirp, or null if none heard. */
+  winnerId: string | null;
+  /** True iff BOTH contest parties appear in measurements (the room-containment bit). */
+  sameRoom: boolean;
+  resolvedTick: number;
+}
+
+/** One-shot chirp-round notification (mirrors wakeOutcome/conversationEvent
+ * semantics): attached to exactly one broadcast, then cleared. The dashboard
+ * uses it to fire the "chirp ping" animation. */
+export interface RangingEvent {
+  /** Always "CHIRP" today; a string tag kept for forward-compat with future
+   * ranging sub-events (e.g. "ESCALATE"). */
+  phase: string;
+  contestIncumbent: string;
+  contestChallenger: string;
+  winnerId: string | null;
+  sameRoom: boolean;
+  atTick: number;
+}
+
+export interface RangingMessage {
+  type: "ranging";
+  /** Current contest state, or null when the election is not contested. */
+  contest: ContestInfo | null;
+  /** Most-recent chirp resolution still considered relevant, or null. */
+  chirp: ChirpInfo | null;
+  fusionReason: FusionReason;
+  /** One-shot; null on every broadcast except the one carrying a fresh chirp. */
+  rangingEvent: RangingEvent | null;
+}
