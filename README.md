@@ -10,7 +10,7 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![BLE](https://img.shields.io/badge/Bluetooth-LE-0082FC?logo=bluetooth&logoColor=white)
-![Status](https://img.shields.io/badge/Phase%203-portable%20conversation-purple)
+![Status](https://img.shields.io/badge/Phase%204-tiered%20sensing-purple)
 
 [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Why hysteresis](#-why-hysteresis-matters) · [Roadmap](#-roadmap) · [Project structure](#-project-structure)
 
@@ -118,6 +118,43 @@ The ~400 ms pause during TRANSFER/CONFIRM is the visceral "the sentence moved" m
 
 **Try it:** run `AetherMesh.bat`, toggle Source → Mesh, type a longish sentence (e.g. *"The quick brown fox jumps over the lazy dog"*), and watch/listen as the simulated scanners walk past each other ~15 s later.
 
+## 🔊 Tiered sensing: BLE + near-ultrasound chirp (Phase 4)
+
+BLE alone has a blind spot: **it can't tell same-room from behind-a-wall.** Two meters in-room and two meters through drywall produce identical RSSI — no amount of filtering fixes this. Phase 4 adds a second sensing tier that can: a near-ultrasound chirp (18–21 kHz, 50–100 ms) emitted by the challenger device, heard (or not heard) by the incumbent and the phone.
+
+```mermaid
+flowchart LR
+    subgraph Tier1["Tier 1 — Always on (BLE)"]
+        RSSI["RSSI ranking\n~80% of arbitrations resolved"]
+    end
+
+    subgraph Tier2["Tier 2 — On demand (ultrasound)"]
+        Chirp["Chirp emitted\n50-100ms, 18-21kHz"]
+        ToF["Time-of-flight\n→ distance + same_room"]
+    end
+
+    subgraph Fusion["Fusion"]
+        Decide["BLE-only\n→ chirp-confirmed\n→ chirp-resolved-tie\n→ chirp-room-containment"]
+    end
+
+    RSSI -- "contested?" --> Chirp --> ToF --> Decide
+```
+
+**The precedence ladder** (highest authority wins):
+
+| Reason | Meaning |
+|---|---|
+| `ble-only` | No contest — BLE alone decides (>5 dBm gap, business as usual) |
+| `chirp-confirmed` | Contest existed, chirp ran, and agreed with BLE's winner |
+| `chirp-resolved-tie` | Contest existed, chirp disagreed, ToF picked a different winner |
+| `chirp-room-containment` | BLE's winner didn't hear the chirp (behind a wall) — overruled |
+
+`chirp-room-containment` is the killer feature: it's the one bit of information BLE **fundamentally cannot produce**, and it's why incumbents can't easily follow. A chirp doesn't pass through drywall; hearing it proves same-room presence. The pure module `ranging.py` implements contest detection, ToF math (`SPEED_OF_SOUND_M_S = 343.0`), and fusion — all deterministic, I/O-free, fully unit-tested (24 tests including a wall-partition kill-test).
+
+The aggregator's `ranging_source` is a **swappable seam**: the default produces deterministic results from a geometry map for demoing, but swapping in real mic capture (recording the chirp, measuring ToF, feeding back `ChirpResult`) requires zero changes to `ranging.py` or `election.py`.
+
+**Wall demo:** run the aggregator with `--ranging-geometry "A=1.5:in,B=2.5:out"` to place scanner B behind a wall. BLE ranks B as owner; the chirp can't reach B; fusion overrides with `chirp-room-containment` and hands ownership to A — the wrong answer corrected by audio physics.
+
 ## ⚖️ Why hysteresis matters
 
 Raw RSSI is noisy. Naively handing ownership to "whoever has the strongest signal *right now*" causes constant flapping between devices with similar signal strength. Measured directly against this repo's dashboard, phone held stationary for 10 seconds:
@@ -171,7 +208,7 @@ flowchart TD
     P1["✅ Phase 1 — Real BLE bridge\nhardware-verified"]
     P2["✅ Phase 2 — Multi-device mesh\nleader election, wake suppression"]
     P3["✅ Phase 3 — Portable conversation\nfour-phase handoff, edge-tts audio"]
-    P4["◻ Phase 4 — Tiered sensing\nBLE + near-ultrasound tie-break"]
+    P4["✅ Phase 4 — Tiered sensing\nBLE + ultrasound chirp fusion"]
     P5["◻ Phase 5 — Open protocol spec"]
 
     P0 --> P1 --> P2 --> P3 --> P4 --> P5
@@ -180,6 +217,7 @@ flowchart TD
     style P1 fill:#0891b2,color:#fff
     style P2 fill:#0891b2,color:#fff
     style P3 fill:#0891b2,color:#fff
+    style P4 fill:#0891b2,color:#fff
 ```
 
 | Phase | Status |
@@ -188,7 +226,7 @@ flowchart TD
 | 1 — Real BLE bridge | ✅ Code complete, hardware-verified live |
 | 2 — Multi-device mesh | ✅ Build 2: aggregator + election + mesh UI, calibration wired, 24 tests green |
 | 3 — Portable conversation state | ✅ Build 1: edge-tts audio, four-phase handoff FSM, conversation UI, 50 tests green |
-| 4 — BLE + near-ultrasound tiered sensing | ◻ Not started |
+| 4 — BLE + near-ultrasound tiered sensing | ✅ Build 1: ranging.py, contest detection, fusion precedence, room-containment, chirp viz, 85 tests green |
 | 5 — Open protocol spec | ◻ Not started |
 
 ## 📁 Project structure
@@ -196,23 +234,25 @@ flowchart TD
 ```
 Aether-BLE/
 ├── Aether.bat              ← one-click single-scanner demo (BLE bridge + dashboard)
-├── AetherMesh.bat          ← one-click Phase 2 mesh demo (2 simulated scanners + aggregator + dashboard)
+├── AetherMesh.bat          ← one-click mesh demo (2 scanners + aggregator + dashboard)
 ├── Aether.md               ← architecture plan, gap analysis, full roadmap
 ├── AETHER_SPEC.md           ← original Phase 0 AI-generation spec
 ├── HANDOFF.md               ← project history / research handoff notes
 ├── CHANGELOG.md
-├── aether-dashboard/         ← Next.js + React + TypeScript, single-file UI
-│   └── src/app/page.tsx      ← dashboard: simulation + Live BLE + Mesh
-└── aether-bridge/            ← Python BLE scanner -> WebSocket bridge + mesh aggregator
-    ├── bridge.py              ← the real-time scanner + server (Phase 1)
+├── aether-dashboard/         ← Next.js + React + TypeScript
+│   ├── src/app/page.tsx      ← dashboard: Room Preview + Live BLE + Mesh
+│   └── src/app/mesh/         ← Mesh viewer: election, conversation, ranging UI
+└── aether-bridge/            ← Python BLE scanner → WebSocket bridge + mesh aggregator
+    ├── bridge.py              ← real-time scanner + server (Phase 1)
     ├── diag.py                ← two-part hardware diagnostic gate
-    ├── aggregator.py          ← Phase 2/3 mesh aggregator + leader election + conversation FSM (serves :8766)
+    ├── aggregator.py          ← mesh aggregator: election + conversation + ranging (serves :8766)
     ├── election.py            ← pure leader-election logic (hysteresis + tie-break)
-    ├── conversation.py        ← pure conversation FSM logic (Phase 3 four-phase handoff)
+    ├── conversation.py        ← pure conversation FSM (Phase 3 four-phase handoff)
+    ├── ranging.py             ← pure tier-2 ranging logic (Phase 4 contest + ToF + fusion)
     ├── simulated_scanner.py   ← hardware-free scanner for mesh demos/tests
-    ├── messages.py            ← locked wire schema (reading / lost / election / conversation)
+    ├── messages.py            ← wire schema (reading / lost / election / conversation / ranging)
     ├── smoothing.py           ← EMA RSSI smoothing
-    └── tests/                 ← pytest: election + aggregator + conversation (50 tests)
+    └── tests/                 ← pytest: election + conversation + ranging + aggregator (85 tests)
 ```
 
 ## 🧱 Tech stack

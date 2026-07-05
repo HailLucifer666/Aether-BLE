@@ -371,17 +371,71 @@ python.exe simulated_scanner.py --scanner SIM-B --port 9002 --script "-70@15,-50
 .venv\Scripts\python.exe -m pytest tests\ -v
 ```
 
-24 tests total: 12 covering pure election logic (`test_election.py`, including the two cross-source "kill-tests"), plus 12 end-to-end tests driving a real aggregator against in-process mock peer servers (`test_aggregator.py`).
+85 tests total: 12 election (`test_election.py`), 19 conversation (`test_conversation.py`), 24 ranging (`test_ranging.py`), and 30 aggregator end-to-end (`test_aggregator.py`, including Phase 2–4 integration tests).
 
 ## Stopping the bridge
 
 Press **Ctrl+C** in the terminal. The bridge (and aggregator / simulated scanner) will:
 
-1. Cancel all scanning / election / broadcast tasks
+1. Cancel all scanning / election / broadcast / conversation / ranging tasks
 2. Close all WebSocket connections
 3. Shut down the server(s)
 4. Exit cleanly
 
+## Tiered sensing — BLE + near-ultrasound chirp (Phase 4)
+
+Phase 4 adds a second sensing tier for when BLE alone can't decide. When two scanners are within the hysteresis margin (a "contested" election), the challenger fires a near-ultrasound chirp (18–21 kHz, 50–100 ms). Time-of-flight measurements determine distance and same-room presence (a chirp can't pass through walls — this is the one bit BLE fundamentally cannot provide). A fusion precedence ladder resolves the contest: `ble-only` → `chirp-confirmed` → `chirp-resolved-tie` → `chirp-room-containment`.
+
+### `ranging.py` — pure tier-2 logic
+
+Zero I/O, fully unit-testable, mirrors `election.py`/`conversation.py` discipline. Key functions:
+
+- `detect_contest(owner, scanners, tick)` — returns a `Contest` when a challenger is within `CONTEST_MARGIN_DB = 3.0` of the incumbent but hasn't exceeded hysteresis.
+- `tof_to_distance(tof_us)` — converts round-trip microseconds to meters (`SPEED_OF_SOUND_M_S = 343.0`).
+- `chirp_from_measurements(measurements, contest, tick)` — picks winner from ToF data, computes `same_room`.
+- `fuse(owner, scanners, contest, chirp)` — applies the fusion precedence ladder and returns a `FusionResult`.
+
+### `--ranging-geometry` flag
+
+Declares per-scanner tier-2 geometry for the synthetic ranging source:
+
+```
+--ranging-geometry "A=1.5:in,B=2.5:out"
+```
+
+- `in` — scanner hears the chirp (same room as user)
+- `out` — scanner is behind a wall (dropped from chirp measurements; fusion can override BLE's answer with `chirp-room-containment`)
+
+**Wall demo example:**
+
+```powershell
+# SIM-B behind a wall: BLE ranks B as owner, chirp can't reach B, fusion overrides to A
+python.exe aggregator.py --peers ws://127.0.0.1:9001,ws://127.0.0.1:9002 --ranging-geometry "SIM-A=1.5:in,SIM-B=2.5:out"
+```
+
+### Ranging source seam
+
+The aggregator accepts an optional `ranging_source` callable — the default is `synthetic_ranging_source` (geometry-based, for demoing). Swapping in real mic capture requires zero changes to `ranging.py` or `election.py`. The seam is the integration point for future real ultrasonic hardware.
+
+### Ranging message format
+
+Broadcast on every tick when tier-2 is active (suppressed when uncontested):
+
+```json
+{
+  "type": "ranging",
+  "owner": "SIM-A",
+  "tick": 4831,
+  "ts": "14:32:41",
+  "contest": {"incumbentId": "SIM-A", "challengerId": "SIM-B", "marginDb": 2.3},
+  "chirp": {"winnerId": "SIM-A", "sameRoom": true, "measurements": [{"scannerId": "SIM-A", "distanceM": 1.5, "tofUs": 8747}]},
+  "fusionReason": "chirp-confirmed",
+  "rangingEvent": null
+}
+```
+
+`rangingEvent` is one-shot — present on the broadcast immediately after a chirp resolves, then `null` again.
+
 ## Next steps
 
-Phase 2 (multi-device mesh + leader election) is now complete — see the [Multi-device mesh](#multi-device-mesh-phase-2) section above. The next phase is portable conversation state: the assistant finishes its sentence on the next device as ownership hands off.
+Phases 0–4 are complete. Phase 5 is the open protocol spec: publish the arbitration + handoff wire protocol so any vendor/device can implement it. The ranging source seam (`ranging_source` callable) is ready for real ultrasonic capture integration.

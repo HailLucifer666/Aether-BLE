@@ -13,3 +13,5 @@ aether-bridge/.pytest_cache/
 
 graphify-out/
 aether-bridge/narration_out/
+demo_output/
+*.log
