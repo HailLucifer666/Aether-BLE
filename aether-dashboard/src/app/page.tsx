@@ -36,15 +36,16 @@ interface HandoffEvent {
 
 type DataSource = "simulation" | "live" | "mesh";
 
-/** Source toggle cycles simulation -> live -> mesh -> simulation. */
+/** Source toggle cycles mesh -> live -> simulation -> mesh. Mesh is the
+ * default since it showcases the full protocol (election + conversation). */
 const DATA_SOURCE_CYCLE: Record<DataSource, DataSource> = {
-  simulation: "live",
-  live: "mesh",
-  mesh: "simulation",
+  mesh: "live",
+  live: "simulation",
+  simulation: "mesh",
 };
 
 const DATA_SOURCE_LABEL: Record<DataSource, string> = {
-  simulation: "Simulation",
+  simulation: "Room Preview",
   live: "Live BLE",
   mesh: "Mesh",
 };
@@ -117,7 +118,7 @@ const HYSTERESIS_THRESHOLD_DB = 5;
 const HYSTERESIS_CONSECUTIVE = 2;
 
 // Live-BLE connection-status debounce: mirrors the same consecutive-streak
-// hysteresis idea already used for simulated device handoff above, applied
+// hysteresis idea already used for the room-preview device handoff above, applied
 // instead to the liveConnection "live" <-> "beacon-lost" transition. The
 // bridge broadcasts every ~0.4s (BROADCAST_INTERVAL_SECONDS in bridge.py),
 // and Windows' BLE scanning stack is known to produce normal multi-second
@@ -151,7 +152,7 @@ export default function Dashboard() {
   const [hysteresisOn, setHysteresisOn] = useState<boolean>(true);
   const [readings, setReadings] = useState<Record<string, number>>({});
 
-  const [dataSource, setDataSource] = useState<DataSource>("simulation");
+  const [dataSource, setDataSource] = useState<DataSource>("mesh");
   const meshSocket = useElectionSocket(dataSource === "mesh");
   const [liveConnection, setLiveConnection] = useState<LiveConnectionState>("connecting");
   const [liveSmoothedRssi, setLiveSmoothedRssi] = useState<number | null>(null);
@@ -487,7 +488,7 @@ export default function Dashboard() {
                     ? "border-cyan-500/60 bg-cyan-500/10 text-cyan-300"
                     : "border-slate-700 bg-slate-900 text-slate-400"
               }`}
-              title="Cycle between the fake 3-device simulation, a live BLE beacon over WebSocket, and the read-only mesh election viewer."
+              title="Cycle between the mesh election viewer, a live BLE beacon over WebSocket, and the room preview."
             >
               <Wifi className="h-4 w-4" />
               Source: {DATA_SOURCE_LABEL[dataSource]}
@@ -582,7 +583,7 @@ export default function Dashboard() {
               className={`relative mt-2 h-8 rounded-lg border border-slate-800 bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 ${
                 isSimulating ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:border-slate-600"
               }`}
-              title={isSimulating ? "Disabled during simulation" : "Click to move the user"}
+              title={isSimulating ? "Disabled while the room walk is running" : "Click to move the user"}
             >
               <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[10px] uppercase tracking-widest text-slate-500">
                 {isSimulating ? "auto-walking…" : "click to move user"}
@@ -674,7 +675,7 @@ export default function Dashboard() {
           <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
             {handoffs.length === 0 && (
               <p className="py-4 text-center text-sm text-slate-600">
-                No handoffs yet — run the simulation or click the track to move around the room.
+                No handoffs yet — run the room walk or click the track to move around the room.
               </p>
             )}
             <AnimatePresence initial={false}>

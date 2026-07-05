@@ -173,7 +173,7 @@ export default function MeshView({
 
         {utterance !== null && utterance.isSynthetic && (
           <p className="mt-2 text-[10px] uppercase tracking-widest text-amber-400/80">
-            TTS offline — simulating playback
+            Voice service offline — showing word progress without audio
           </p>
         )}
 

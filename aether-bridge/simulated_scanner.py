@@ -67,15 +67,19 @@ def parse_script(script: str) -> list[ScriptSegment]:
 class ScriptedRssiSource:
     """Produces the current target base RSSI given elapsed simulated time.
 
-    Ramps linearly through each segment in order, then holds the final
-    segment's target RSSI indefinitely once all segments have elapsed.
+    Ramps linearly through each segment in order, then loops back to the
+    start and replays the same script indefinitely - so a scripted "walk"
+    keeps producing handoffs for demos/recordings longer than one pass.
     """
 
     def __init__(self, start_rssi: float, segments: list[ScriptSegment]) -> None:
         self._start_rssi = start_rssi
         self._segments = segments
+        self._total_duration = sum(segment.duration_seconds for segment in segments)
 
     def value_at(self, elapsed_seconds: float) -> float:
+        if self._total_duration > 0:
+            elapsed_seconds = elapsed_seconds % self._total_duration
         previous_rssi = self._start_rssi
         segment_start = 0.0
         for segment in self._segments:

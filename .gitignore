@@ -12,3 +12,4 @@ aether-bridge/.pytest_cache/
 .claude/
 
 graphify-out/
+aether-bridge/narration_out/

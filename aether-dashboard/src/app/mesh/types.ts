@@ -81,7 +81,7 @@ export interface TranscriptEntry {
 
 export interface ConversationUtterance {
   text: string;
-  /** data: URL (`data:audio/mp3;base64,...`) or null in synthetic mode. */
+  /** data: URL (`data:audio/mp3;base64,...`), or null when no audio was generated. */
   audioBase64: string | null;
   durationMs: number;
   offsetMs: number;

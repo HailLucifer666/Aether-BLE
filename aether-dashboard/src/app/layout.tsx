@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Aether Protocol v0.1",
   description:
-    "Cross-Device AI Arbitration — BLE proximity handoff demo. The conversation follows you.",
+    "Cross-Device AI Arbitration — the conversation follows you between devices.",
 };
 
 export default function RootLayout({
