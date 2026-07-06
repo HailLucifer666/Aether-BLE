@@ -229,7 +229,6 @@ flowchart TD
 | 3 — Portable conversation state | ✅ Build 1: edge-tts audio, four-phase handoff FSM, conversation UI, 50 tests green |
 | 4 — BLE + near-ultrasound tiered sensing | ✅ Build 1: ranging.py, contest detection, fusion precedence, room-containment, chirp viz, 85 tests green |
 | 5 — Open protocol spec | ✅ [`PROTOCOL.md`](PROTOCOL.md) — implementation-independent wire format, election algorithm, and conformance rules |
-| 5 — Open protocol spec | ◻ Not started |
 
 ## 📁 Project structure
 
