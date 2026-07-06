@@ -56,3 +56,12 @@ BLE alone cannot distinguish same-room from behind-a-wall (2 m in-room and 2 m t
 **Status:** Code complete, 85/85 tests green, dashboard compiles (`tsc --noEmit` + `next build` clean). Wall demo: `aggregator.py --ranging-geometry "A=1.5:in,B=2.5:out"`.
 
 **Non-goals deferred to a later build:** real ultrasonic emission/capture (the `ranging_source` seam is ready; the mic/audio layer is the integration point), multi-chirp averaging (currently one chirp per contest episode), Kalman-style sensor fusion with UWB.
+
+## Phase 5 — Open protocol spec
+
+Aether's wire format and election algorithm are now documented independently of this repo's Python/TypeScript implementation, so a compatible scanner, aggregator, or client can be built in any language without reading the source.
+
+- **[`PROTOCOL.md`](PROTOCOL.md)** — actors and topology (scanner / aggregator / client star topology, scanners never talk to each other), the full WebSocket message contract (`reading`, `lost`, `election`, `conversation`, `ranging`, inbound `wake`/`say`), the normative `elect()` decision procedure (hysteresis constants, candidacy rule, calibration offset, tie-break), the four-phase conversation handoff FSM, the tier-2 ranging fusion precedence ladder, a versioning/compatibility rule (additive-only: unrecognized types and fields must be ignored, not fatal), a reference-implementation map back to the actual source files, and an explicit non-goals section (no wake-word/STT/dialogue/TTS, no auth, no service discovery — Aether decides *who* answers, not *how*).
+- Every schema and constant in the spec was cross-checked against the running code (`election.py`, `conversation.py`, `ranging.py`, `messages.py`, `aggregator.py`) rather than written from memory — including a subtle point that's easy to get wrong from the docstrings alone: `lastHandoff` is *not* one-shot like `wakeOutcome`/`conversationEvent`/`rangingEvent` — it persists across broadcasts until superseded by a newer handoff, verified directly against the aggregator's broadcast loop.
+
+**Status:** Documentation only, no code changes. This closes the roadmap — all five phases are now ✅.

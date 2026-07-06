@@ -10,9 +10,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![BLE](https://img.shields.io/badge/Bluetooth-LE-0082FC?logo=bluetooth&logoColor=white)
-![Status](https://img.shields.io/badge/Phase%204-tiered%20sensing-purple)
+![Status](https://img.shields.io/badge/Phase%205-open%20protocol-purple)
 
-[Quick start](#-quick-start) · [How it works](#-how-it-works) · [Why hysteresis](#-why-hysteresis-matters) · [Roadmap](#-roadmap) · [Project structure](#-project-structure)
+[Quick start](#-quick-start) · [How it works](#-how-it-works) · [Why hysteresis](#-why-hysteresis-matters) · [Protocol spec](PROTOCOL.md) · [Roadmap](#-roadmap) · [Project structure](#-project-structure)
 
 </div>
 
@@ -209,7 +209,7 @@ flowchart TD
     P2["✅ Phase 2 — Multi-device mesh\nleader election, wake suppression"]
     P3["✅ Phase 3 — Portable conversation\nfour-phase handoff, edge-tts audio"]
     P4["✅ Phase 4 — Tiered sensing\nBLE + ultrasound chirp fusion"]
-    P5["◻ Phase 5 — Open protocol spec"]
+    P5["✅ Phase 5 — Open protocol spec"]
 
     P0 --> P1 --> P2 --> P3 --> P4 --> P5
 
@@ -218,6 +218,7 @@ flowchart TD
     style P2 fill:#0891b2,color:#fff
     style P3 fill:#0891b2,color:#fff
     style P4 fill:#0891b2,color:#fff
+    style P5 fill:#0891b2,color:#fff
 ```
 
 | Phase | Status |
@@ -227,6 +228,7 @@ flowchart TD
 | 2 — Multi-device mesh | ✅ Build 2: aggregator + election + mesh UI, calibration wired, 24 tests green |
 | 3 — Portable conversation state | ✅ Build 1: edge-tts audio, four-phase handoff FSM, conversation UI, 50 tests green |
 | 4 — BLE + near-ultrasound tiered sensing | ✅ Build 1: ranging.py, contest detection, fusion precedence, room-containment, chirp viz, 85 tests green |
+| 5 — Open protocol spec | ✅ [`PROTOCOL.md`](PROTOCOL.md) — implementation-independent wire format, election algorithm, and conformance rules |
 | 5 — Open protocol spec | ◻ Not started |
 
 ## 📁 Project structure
@@ -234,7 +236,9 @@ flowchart TD
 ```
 Aether-BLE/
 ├── Aether.bat              ← one-click single-scanner demo (BLE bridge + dashboard)
-├── AetherMesh.bat          ← one-click mesh demo (2 scanners + aggregator + dashboard)
+├── AetherMesh.bat          ← one-click mesh demo (2 simulated scanners + aggregator + dashboard)
+├── AetherAll.bat           ← one-click combined launcher (bridge + mesh + dashboard together)
+├── PROTOCOL.md             ← implementation-independent protocol spec (Phase 5)
 ├── Aether.md               ← architecture plan, gap analysis, full roadmap
 ├── AETHER_SPEC.md           ← original Phase 0 AI-generation spec
 ├── HANDOFF.md               ← project history / research handoff notes
