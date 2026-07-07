@@ -1,0 +1,10 @@
+# Tech Stack — Phase 8
+
+- **Wake word:** `openwakeword` (tflite-based, pretrained models, pip-installable) — pinned as a new dependency in `aether-bridge/requirements.txt`. Runs inference on live mic frames captured via `sounddevice` (new dependency; simpler cross-platform mic-capture API than raw `pyaudio`).
+- **TTS:** `piper-tts` (local, ONNX-based neural TTS, pip-installable, no cloud) replaces `edge-tts` in `aggregator.py:_generate_speech`. `edge-tts` entry removed from `requirements.txt`.
+- **LLM:** existing local Ollama installation (already running, models `gemma3:1b-it-qat`/`qwen3` already pulled) via plain `httpx`/`requests` HTTP calls to `http://localhost:11434/api/generate` — no new Ollama install, no new heavy client library beyond what's already a transitive dependency (use `requests`, already imported elsewhere in this codebase if present, else add it — check before adding).
+- **HA integration:** `wyoming` Python package (the official protocol library, pip-installable) for `wyoming_satellite.py` — implements the JSONL-header + binary-payload framing so we don't hand-roll the wire format.
+- **Process model:** `wake_listener.py` runs as its own process per mic-equipped node, same pattern as `bridge.py` (a lightweight WS client to the aggregator, not a library import into `aggregator.py`) — keeps the aggregator's own dependency surface free of audio-capture libraries.
+- **Testing:** pytest, same as the rest of `aether-bridge/`. New tests live in `aether-bridge/tests/test_wake_listener.py`, `test_llm.py`, `test_wyoming_satellite.py`, mirroring existing naming.
+
+Rationale: every new dependency is local-only (no cloud), pip-installable into the existing `aether-bridge/.venv` (already present, project-isolated — no global installs), and each library is the "pick one, don't build custom" default for its job (Wyoming's own protocol library instead of hand-rolling a wire parser, Piper instead of building a TTS engine, openWakeWord instead of training a custom wake-word model).
