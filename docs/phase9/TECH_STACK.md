@@ -1,0 +1,9 @@
+# Tech Stack — Phase 9
+
+- **DSP:** `numpy`/`scipy` only (`scipy.signal` for chirp generation and matched-filter/cross-correlation ToF detection) — matches the original roadmap's own stated constraint ("numpy/scipy only; feed with recorded traces in CI"). No new heavy audio-processing dependency.
+- **Audio I/O:** `sounddevice`, already a Phase 8 dependency (used by `wake_listener.py`) — reused for chirp playback + capture, no new library.
+- **Kalman filter:** hand-rolled in `fusion_2d.py` using plain numpy linear algebra (a 2-D constant-velocity Kalman filter is ~40 lines of matrix math) rather than pulling in `filterpy` or similar — keeps the dependency surface at zero new packages for this module, matching this codebase's existing preference (see Phase 7's TECH_STACK.md: "pick the platform-native/pure option over a third-party library" and Phase 6's beacon math being hand-rolled HMAC rather than a framework).
+- **Room adjacency:** plain Python dict-based co-occurrence counting, persisted the same way `beacon_auth.py`'s counter store or `realm.py`'s realm file already persist small local JSON state (`~/.aether/`) — no new persistence mechanism invented.
+- **Testing:** pytest, `aether-bridge/tests/test_chirp_audio.py`, `test_fusion_2d.py`, `test_room_adjacency.py`, `test_real_ranging_source.py` (the last one testable only for wiring/interface correctness with a mocked `sounddevice`, per PRD's disclosed hardware limitation).
+
+Rationale: every new module stays inside the existing dependency footprint (numpy/scipy/sounddevice, all already present or trivially added) and follows this codebase's established pattern of hand-rolling small, well-understood algorithms (Kalman math, HMAC, JSON persistence) rather than importing a framework for something a few dozen lines of numpy already does correctly.
