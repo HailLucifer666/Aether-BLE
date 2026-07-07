@@ -179,3 +179,52 @@ export interface RangingMessage {
   /** One-shot; null on every broadcast except the one carrying a fresh chirp. */
   rangingEvent: RangingEvent | null;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 10 — spatial fusion: 2-D position, device placement, calibration,
+// and live tuning.
+//
+// Added as new message types alongside the existing Election/Conversation/
+// Ranging contracts, which stay frozen and untouched. `position` is
+// server->client only, broadcast once per tracked user with an active fusion
+// track (omitted entirely from the wire when no track exists yet). The other
+// three are client->server only, sent by the Spatial/Setup/Signal Lab views.
+// ---------------------------------------------------------------------------
+
+/** Server->client: one broadcast per tracked user with an active fusion
+ * track. Omitted entirely when no track exists yet (fresh install / nothing
+ * placed on the floor plan) - the dashboard must render correctly with zero
+ * of these ever arriving. */
+export interface PositionMessage {
+  type: "position";
+  userId: string;
+  x: number;
+  y: number;
+  uncertaintyRadiusM: number;
+}
+
+/** Client->server: sent when the user drags a scanner icon on the floor
+ * plan (on pointerup, not every pointermove tick). */
+export interface PlaceDeviceMessage {
+  type: "placeDevice";
+  scannerId: string;
+  x: number;
+  y: number;
+}
+
+/** Client->server: sent from the setup wizard's numeric calibration inputs
+ * (on submit/blur, not on every keystroke). */
+export interface SetCalibrationMessage {
+  type: "setCalibration";
+  scannerId: string;
+  rssiAt1m: number;
+  pathLossExponent: number;
+}
+
+/** Client->server: sent from Signal Lab's tuning sliders (debounced). */
+export interface SetTuningMessage {
+  type: "setTuning";
+  hysteresisDb: number;
+  consecutiveTicks: number;
+  contestMarginDb: number;
+}

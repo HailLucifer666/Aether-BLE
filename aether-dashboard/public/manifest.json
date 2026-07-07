@@ -1,0 +1,17 @@
+{
+  "name": "Aether",
+  "short_name": "Aether",
+  "description": "Aether spatial mesh dashboard — floor plan, live position, signal lab, timeline, and setup wizard for the Aether BLE mesh aggregator.",
+  "start_url": "/spatial",
+  "display": "standalone",
+  "background_color": "#0a0f1e",
+  "theme_color": "#0a0f1e",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

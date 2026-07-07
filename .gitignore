@@ -8,8 +8,18 @@ aether-bridge/.pip-cache/
 aether-bridge/__pycache__/
 aether-bridge/**/__pycache__/
 aether-bridge/.pytest_cache/
+aether-bridge/.coverage
+aether-bridge/models/
 
 .claude/
+
+android-sdk/
+jdk-temurin/
+aether-android/.gradle/
+aether-android/*/build/
+aether-android/local.properties
+aether-android/*.iml
+aether-android/.idea/
 
 graphify-out/
 aether-bridge/narration_out/

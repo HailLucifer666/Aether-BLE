@@ -11,12 +11,20 @@ keypress) that resolves which scanner should react to a wake event given
 current ownership.
 
 Phase 3 adds: a "say" inbound message that generates a real TTS utterance
-(edge-tts, free/keyless) and assigns it to the current owner; and a
-four-phase handoff contract (PREPARE -> TRANSFER -> CONFIRM -> RELEASE)
-that migrates the active utterance to the new owner when ownership changes
-mid-sentence, so the assistant literally finishes its sentence on the next
-device. edge-tts is optional - if it's missing or the network is down, a
-synthetic utterance (no audio) keeps the migration demo working.
+and assigns it to the current owner; and a four-phase handoff contract
+(PREPARE -> TRANSFER -> CONFIRM -> RELEASE) that migrates the active
+utterance to the new owner when ownership changes mid-sentence, so the
+assistant literally finishes its sentence on the next device. TTS
+generation (Phase 8: Piper, local/no-cloud) is optional - if it's missing
+or fails, a synthetic utterance (no audio) keeps the migration demo
+working.
+
+Phase 8 adds: a "ask" inbound message that generates a real LLM reply
+(local Ollama, via llm.py) for freeform user text, then feeds that reply
+into the same _handle_say pipeline below - so an LLM-generated utterance is
+owned/migrated identically to a manually-issued "say". _generate_speech now
+tries Piper (local, no-cloud) first, preserving the exact synthetic-
+fallback resilience the edge-tts path had.
 
 Phase 4 adds tiered sensing: BLE alone (tier 1) resolves ~80% of
 arbitrations; the remaining photo-finishes escalate to a near-ultrasound
@@ -36,11 +44,15 @@ import asyncio
 import base64
 import json
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import websockets
 
+import ranging as ranging_mod
+import llm
+from piper_tts import PiperTTSError, estimate_duration_ms, pcm_to_wav_bytes, synthesize_pcm
 from conversation import (
     PHASE_IDLE,
     SYNTHETIC_MS_PER_CHAR,
@@ -52,8 +64,10 @@ from conversation import (
     start_utterance,
     utterance_progress,
 )
-from election import ChallengerState, Handoff, ScannerState, elect
-from messages import build_conversation_message, build_election_message, build_ranging_message
+from election import ChallengerState, ElectionTuning, Handoff, ScannerState, elect
+from fusion_2d import FusionTracker
+from layout import LayoutStore, LayoutValidationError, rssi_to_distance_m
+from messages import build_conversation_message, build_election_message, build_position_message, build_ranging_message
 from ranging import (
     ChirpMeasurement,
     ChirpResult,
@@ -72,12 +86,41 @@ PRESENCE_TIMEOUT_SECONDS = 6.0
 KEYPRESS_POLL_INTERVAL_SECONDS = 0.05
 WAKE_KEYS = {b" ", b"\r"}
 
+# Phase 8: cap on any text that reaches TTS synthesis via "say"/"ask" -
+# without this, an unbounded string keeps Piper synthesizing (and the
+# WS broadcast payload growing) for an attacker-controlled duration.
+# Truncated (not rejected) to match the project's existing "never crash,
+# always degrade" resilience pattern rather than dropping the utterance.
+MAX_TTS_TEXT_LENGTH = 2000
+
 # Phase 4: how many ticks a chirp resolution stays "fresh" for fusion before
 # the aggregator demands a new chirp if the contest is still active. Two
 # ticks matches the election hysteresis window (HYSTERESIS_CONSECUTIVE) so a
 # chirp-backed override needs to survive the same scrutiny a hysteresis
 # handoff would.
 CHIRP_FRESH_TICKS = 2
+
+# Phase 10: sane numeric bounds for the setTuning message. Matches the
+# PRD's stated ranges - out-of-range or non-numeric input is logged and
+# dropped rather than applied (never crash, always degrade).
+MIN_HYSTERESIS_DB = 0.0
+MAX_HYSTERESIS_DB = 20.0
+MIN_CONSECUTIVE_TICKS = 1
+MAX_CONSECUTIVE_TICKS = 20
+MIN_CONTEST_MARGIN_DB = 0.0
+MAX_CONTEST_MARGIN_DB = 20.0
+
+# Security: placeDevice/setCalibration are reachable from any unauthenticated
+# LAN peer (same trust model as say/wake/ask), and each one triggers a full
+# rewrite of ~/.aether/layout.json via layout.py's LayoutStore._save() - a
+# rapid-fire flood of either message meant unbounded disk I/O with no
+# backpressure. This is a genuinely new resource-exhaustion vector Phase 10
+# introduced (say/wake/ask are naturally bounded by TTS/LLM latency; a layout
+# write is not), so it gets the same fix Phase 8's Wyoming Synthesize handler
+# got: a minimum interval between accepted writes per message type, silently
+# dropping anything that arrives too soon rather than queuing it - "degrade,
+# never crash" per this codebase's existing style.
+MIN_LAYOUT_WRITE_INTERVAL_SECONDS = 0.1
 
 
 @dataclass
@@ -230,6 +273,7 @@ class Aggregator:
         tick_ms: int,
         peer_offsets: dict[str, float] | None = None,
         ranging_source: "RangingSource | None" = None,
+        layout_store: "LayoutStore | None" = None,
     ) -> None:
         self.peer_urls = peer_urls
         self.host = host
@@ -280,6 +324,22 @@ class Aggregator:
         self._last_fusion_reason: str = "ble-only"
         self._pending_ranging_event: dict | None = None
         self._ranging_dirty = False
+
+        # Phase 10: persisted scanner placement/calibration + the 2-D fusion
+        # tracker (fills fusion_2d.py's previously-dormant call site). The
+        # layout store defaults to layout.py's own default path
+        # (~/.aether/layout.json), matching room_adjacency.py's convention.
+        # _tuning is the mutable live-tunable election/contest parameters
+        # (Phase 10's setTuning message target); ranging.py's module-level
+        # CONTEST_MARGIN_DB is kept in lockstep by _handle_set_tuning via
+        # direct module-attribute assignment, since detect_contest() reads
+        # that module global and its algorithm is not touched this phase.
+        self._layout = layout_store or LayoutStore()
+        self._fusion_tracker = FusionTracker()
+        self._tuning = ElectionTuning()
+        # Rate-limit gate for the two message types that trigger a full
+        # layout.json rewrite - see MIN_LAYOUT_WRITE_INTERVAL_SECONDS above.
+        self._last_layout_write_monotonic: float | None = None
 
         self.clients: set = set()
         self._stop_event = asyncio.Event()
@@ -394,7 +454,7 @@ class Aggregator:
             self._tick += 1
             scanners = self._election_scanner_states()
             previous_owner = self._owner
-            result = elect(self._owner, scanners, self._challenger)
+            result = elect(self._owner, scanners, self._challenger, self._tuning)
             ble_owner = result.new_owner
             self._challenger = result.challenger
 
@@ -438,6 +498,74 @@ class Aggregator:
             # chirp exists, so the dashboard's ranging panel reflects state.
             if contest is not None or chirp is not None:
                 self._ranging_dirty = True
+
+            # Phase 10: advisory 2-D fusion. Purely additive - never consulted
+            # by the owner decision above (fusion.owner already resolved).
+            # Feeds the elected/fused owner's identity as the tracked
+            # "user_id" (this codebase's Phase 9 ceiling: one track per
+            # beacon identity, and the owning scanner is the best available
+            # proxy for "the phone" until per-device identity exists).
+            if self._owner is not None:
+                self._update_fusion_track(self._owner, scanners, chirp)
+
+    def _update_fusion_track(
+        self, user_id: str, scanners: list[ScannerState], chirp: ChirpResult | None
+    ) -> None:
+        """Convert each present scanner's calibrated RSSI to a distance (via
+        this scanner's layout.py calibration) and fold it into the
+        FusionTracker, matching fusion_2d.update_from_scanner_distances'
+        chirp_scanner_id contract: the freshest chirp's own ToF-derived
+        distance_m (cm-grade precision) overrides the RSSI-derived distance
+        for whichever scanner produced that chirp measurement, only while
+        that chirp is still fresh (the caller already gates `chirp` via
+        _fresh_chirp() - the same freshness check _current_ranging_message
+        uses).
+
+        Scanners with no placed position or no calibration are silently
+        skipped (no geometry/model to convert their RSSI against yet) - this
+        never raises, so a not-yet-configured layout can't stall the tick
+        loop.
+        """
+        scanner_positions = self._layout.get_scanner_positions()
+        if not scanner_positions:
+            return  # nothing placed yet - fusion has no geometry to run on
+
+        scanner_distances: dict[str, float] = {}
+        for scanner in scanners:
+            if not scanner.present:
+                continue
+            calibrated = scanner.calibrated_rssi()
+            if calibrated is None:
+                continue
+            if scanner.id not in scanner_positions:
+                continue
+            calibration = self._layout.get_calibration(scanner.id)
+            if calibration is None:
+                continue
+            scanner_distances[scanner.id] = rssi_to_distance_m(calibrated, calibration)
+
+        chirp_scanner_id = None
+        if chirp is not None:
+            for measurement in chirp.measurements:
+                if measurement.scanner_id in scanner_positions:
+                    # Chirp ToF distance is much more precise than the RSSI
+                    # conversion above - override that scanner's distance
+                    # reading with the chirp's own measurement before fusion,
+                    # and mark it so update() applies chirp-grade noise.
+                    scanner_distances[measurement.scanner_id] = measurement.distance_m
+                    chirp_scanner_id = measurement.scanner_id
+                    break
+
+        if not scanner_distances:
+            return
+
+        self._fusion_tracker.update(
+            user_id,
+            self._tick,
+            scanner_positions,
+            scanner_distances,
+            chirp_scanner_id=chirp_scanner_id,
+        )
 
     def _fresh_chirp(self) -> ChirpResult | None:
         """Return _last_chirp if it's still within CHIRP_FRESH_TICKS, else None.
@@ -606,12 +734,14 @@ class Aggregator:
     async def _handle_say(self, text: str) -> None:
         """Generate a TTS utterance for `text` and assign it to the current owner.
 
-        Tries edge-tts (free, keyless Microsoft neural voices) first. On ANY
-        failure (module missing, network down, rate-limited, malformed text),
+        Tries Piper (local, ONNX-based neural TTS, no cloud) first. On ANY
+        failure (model missing, subprocess/inference error, malformed text),
         falls back to a synthetic utterance that has no audio but advances
         on the same progress clock - so the handoff-migration demo still
         works offline. Either way the conversation FSM and broadcast are
-        identical; only the audio payload differs.
+        identical; only the audio payload differs. Reused by _handle_ask
+        (Phase 8) so an LLM-generated reply is spoken/owned identically to a
+        manually-issued "say".
         """
         owner = self._owner
         if owner is None:
@@ -621,6 +751,8 @@ class Aggregator:
         text = text.strip()
         if not text:
             return
+        if len(text) > MAX_TTS_TEXT_LENGTH:
+            text = text[:MAX_TTS_TEXT_LENGTH]
 
         audio_b64, duration_ms, is_synthetic = await self._generate_speech(text)
 
@@ -636,52 +768,61 @@ class Aggregator:
             role="assistant",
         )
         self._conversation_dirty = True
-        kind = "synthetic" if is_synthetic else "edge-tts"
+        kind = "synthetic" if is_synthetic else "piper"
         print(
             f"[aggregator] SAY tick={self._tick} owner={owner} "
             f"({kind}, {duration_ms}ms, {len(text)} chars): {text[:60]!r}"
         )
 
+    async def _handle_ask(self, text: str) -> None:
+        """Phase 8: generate an LLM reply for `text` and speak it via the
+        existing _handle_say pipeline, additive alongside the manual "say"
+        path (which stays exactly as-is for debugging/demos).
+
+        Builds transcript context from the current conversation transcript,
+        calls llm.generate_reply (local Ollama). On any LLM failure, falls
+        back to llm.FALLBACK_REPLY rather than dropping the ask entirely -
+        the conversation FSM and TTS pipeline still run, just with a fixed
+        apology string instead of a generated reply, mirroring the same
+        "never crash, always degrade" resilience _generate_speech already
+        has for TTS failures.
+        """
+        text = text.strip()
+        if not text:
+            return
+
+        transcript_context = [
+            {"role": entry.role, "text": entry.text} for entry in self._conversation.transcript
+        ]
+
+        try:
+            reply_text = await asyncio.to_thread(llm.generate_reply, transcript_context, text)
+        except llm.LLMError as exc:
+            print(f"[aggregator] ASK llm.generate_reply failed ({exc}); using fallback reply.")
+            reply_text = llm.FALLBACK_REPLY
+
+        await self._handle_say(reply_text)
+
     async def _generate_speech(self, text: str) -> tuple[str | None, int, bool]:
         """Returns (audio_base64_data_url, duration_ms, is_synthetic).
 
-        On any failure returns (None, synthetic_estimate, True).
+        Tries Piper (local, ONNX-based neural TTS, no cloud) first via the
+        shared piper_tts.py module - the same path wyoming_satellite.py uses
+        for HA-driven synthesis. On ANY failure (model missing, synthesis
+        error) returns (None, synthetic_estimate, True), preserving the
+        exact resilience property the old edge-tts path had: a TTS failure
+        must never crash the aggregator or block the conversation FSM.
         """
         try:
-            import edge_tts  # imported lazily so the aggregator runs without it
-        except Exception as exc:  # noqa: BLE001 - any import failure -> fallback
-            print(f"[aggregator] edge-tts unavailable ({exc}); using synthetic utterance.")
+            pcm_bytes, sample_rate = await asyncio.to_thread(synthesize_pcm, text)
+        except PiperTTSError as exc:
+            print(f"[aggregator] Piper TTS failed ({exc}); using synthetic utterance.")
             return None, self._synthetic_duration(text), True
 
-        try:
-            communicate = edge_tts.Communicate(text, voice="en-US-AriaNeural")
-            chunks = []
-            total_ms = 0
-            async for chunk in communicate.stream():
-                if chunk.get("type") == "audio":
-                    data = chunk.get("data")
-                    if isinstance(data, bytes):
-                        chunks.append(data)
-                elif chunk.get("type") == "WordBoundary":
-                    # offset + duration are in 100-nanosecond units; the
-                    # last WordBoundary's offset+duration gives total spoken
-                    # duration. Fall back to a byte-length estimate below
-                    # if no WordBoundary events arrive.
-                    offset = chunk.get("offset", 0)
-                    duration = chunk.get("duration", 0)
-                    total_ms = max(total_ms, int((offset + duration) / 10_000))
-            audio_bytes = b"".join(chunks)
-            if not audio_bytes:
-                raise RuntimeError("edge-tts returned no audio data")
-            if total_ms <= 0:
-                # ~1 KB mp3 per second of 24kbps neural speech as a rough
-                # estimate when WordBoundary metadata is unavailable.
-                total_ms = max(self._synthetic_duration(text), int(len(audio_bytes) / 1.0))
-            audio_b64 = "data:audio/mp3;base64," + base64.b64encode(audio_bytes).decode("ascii")
-            return audio_b64, total_ms, False
-        except Exception as exc:  # noqa: BLE001 - network/service failure -> fallback
-            print(f"[aggregator] edge-tts generation failed ({exc}); using synthetic utterance.")
-            return None, self._synthetic_duration(text), True
+        wav_bytes = pcm_to_wav_bytes(pcm_bytes, sample_rate)
+        duration_ms = max(self._synthetic_duration(text), estimate_duration_ms(len(pcm_bytes), sample_rate))
+        audio_b64 = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
+        return audio_b64, duration_ms, False
 
     @staticmethod
     def _synthetic_duration(text: str) -> int:
@@ -775,6 +916,149 @@ class Aggregator:
                 # handler returns promptly. The task sets _conversation_dirty
                 # when the utterance is ready, which the broadcast loop picks up.
                 asyncio.ensure_future(self._handle_say(text))
+        elif msg_type == "ask":
+            text = message.get("text")
+            if isinstance(text, str) and text.strip():
+                # LLM generation + TTS are both async; dispatch as a task so
+                # the inbound handler returns promptly, same pattern as "say".
+                asyncio.ensure_future(self._handle_ask(text))
+        elif msg_type == "placeDevice":
+            self._handle_place_device(message)
+        elif msg_type == "setCalibration":
+            self._handle_set_calibration(message)
+        elif msg_type == "setTuning":
+            self._handle_set_tuning(message)
+
+    # -- Phase 10: layout placement / calibration / tuning inbound messages -
+
+    def _layout_write_allowed(self) -> bool:
+        """Rate-limit gate shared by placeDevice/setCalibration - see
+        MIN_LAYOUT_WRITE_INTERVAL_SECONDS. Stamps the timestamp only when the
+        write is allowed (stamp-before-write ordering, same as Phase 8's
+        Wyoming Synthesize fix), so a burst never lets two writes slip
+        through within the same interval."""
+        now = time.monotonic()
+        if (
+            self._last_layout_write_monotonic is not None
+            and now - self._last_layout_write_monotonic < MIN_LAYOUT_WRITE_INTERVAL_SECONDS
+        ):
+            return False
+        self._last_layout_write_monotonic = now
+        return True
+
+    def _handle_place_device(self, message: dict) -> None:
+        """placeDevice {scannerId, x, y} - LAN-trust model, same as say/wake.
+
+        Validates via layout.py before writing; on any invalid input, logs a
+        warning and drops the message (never crashes the tick loop, never
+        corrupts the persisted layout file). Rate-limited per
+        MIN_LAYOUT_WRITE_INTERVAL_SECONDS - a flood of placeDevice messages
+        is silently dropped rather than each one rewriting layout.json.
+        """
+        if not self._layout_write_allowed():
+            return
+        scanner_id = message.get("scannerId")
+        x = message.get("x")
+        y = message.get("y")
+        if not isinstance(scanner_id, str) or not scanner_id:
+            print(f"[aggregator] WARNING: placeDevice missing/invalid scannerId; dropping. {message!r}")
+            return
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            print(f"[aggregator] WARNING: placeDevice x/y must be numbers; dropping. {message!r}")
+            return
+        try:
+            self._layout.set_position(scanner_id, float(x), float(y))
+        except LayoutValidationError as exc:
+            print(f"[aggregator] WARNING: placeDevice rejected ({exc}); dropping.")
+            return
+        print(f"[aggregator] LAYOUT placeDevice {scanner_id} -> ({x}, {y})")
+
+    def _handle_set_calibration(self, message: dict) -> None:
+        """setCalibration {scannerId, rssiAt1m, pathLossExponent} - same
+        trust model and drop-on-invalid discipline as _handle_place_device.
+        Shares the same rate-limit gate (both hit the same layout.json)."""
+        if not self._layout_write_allowed():
+            return
+        scanner_id = message.get("scannerId")
+        rssi_at_1m = message.get("rssiAt1m")
+        path_loss_exponent = message.get("pathLossExponent")
+        if not isinstance(scanner_id, str) or not scanner_id:
+            print(f"[aggregator] WARNING: setCalibration missing/invalid scannerId; dropping. {message!r}")
+            return
+        if not isinstance(rssi_at_1m, (int, float)) or not isinstance(path_loss_exponent, (int, float)):
+            print(f"[aggregator] WARNING: setCalibration rssiAt1m/pathLossExponent must be numbers; dropping. {message!r}")
+            return
+        try:
+            self._layout.set_calibration(scanner_id, float(rssi_at_1m), float(path_loss_exponent))
+        except LayoutValidationError as exc:
+            print(f"[aggregator] WARNING: setCalibration rejected ({exc}); dropping.")
+            return
+        print(
+            f"[aggregator] LAYOUT setCalibration {scanner_id} -> "
+            f"rssiAt1m={rssi_at_1m} pathLossExponent={path_loss_exponent}"
+        )
+
+    def _handle_set_tuning(self, message: dict) -> None:
+        """setTuning {hysteresisDb, consecutiveTicks, contestMarginDb}.
+
+        Validates numeric ranges (hysteresisDb in [0,20], consecutiveTicks a
+        positive int in [1,20], contestMarginDb in [0,20]) before mutating
+        anything. On any invalid field, logs a warning and drops the ENTIRE
+        message (partial application would leave tuning in a state the
+        sender never asked for) - mirrors this codebase's "never crash,
+        always degrade" resilience style.
+
+        Applies to self._tuning (consumed by election.elect() every tick)
+        AND to ranging.CONTEST_MARGIN_DB (a module-level global that
+        detect_contest() reads directly; ranging.py's own contest-detection
+        algorithm is unchanged - only where that one number comes from).
+        """
+        hysteresis_db = message.get("hysteresisDb")
+        consecutive_ticks = message.get("consecutiveTicks")
+        contest_margin_db = message.get("contestMarginDb")
+
+        if not isinstance(hysteresis_db, (int, float)) or isinstance(hysteresis_db, bool):
+            print(f"[aggregator] WARNING: setTuning hysteresisDb must be a number; dropping. {message!r}")
+            return
+        if not isinstance(consecutive_ticks, int) or isinstance(consecutive_ticks, bool):
+            print(f"[aggregator] WARNING: setTuning consecutiveTicks must be an int; dropping. {message!r}")
+            return
+        if not isinstance(contest_margin_db, (int, float)) or isinstance(contest_margin_db, bool):
+            print(f"[aggregator] WARNING: setTuning contestMarginDb must be a number; dropping. {message!r}")
+            return
+
+        if not (MIN_HYSTERESIS_DB <= hysteresis_db <= MAX_HYSTERESIS_DB):
+            print(
+                f"[aggregator] WARNING: setTuning hysteresisDb={hysteresis_db} out of "
+                f"range [{MIN_HYSTERESIS_DB}, {MAX_HYSTERESIS_DB}]; dropping."
+            )
+            return
+        if not (MIN_CONSECUTIVE_TICKS <= consecutive_ticks <= MAX_CONSECUTIVE_TICKS):
+            print(
+                f"[aggregator] WARNING: setTuning consecutiveTicks={consecutive_ticks} out of "
+                f"range [{MIN_CONSECUTIVE_TICKS}, {MAX_CONSECUTIVE_TICKS}]; dropping."
+            )
+            return
+        if not (MIN_CONTEST_MARGIN_DB <= contest_margin_db <= MAX_CONTEST_MARGIN_DB):
+            print(
+                f"[aggregator] WARNING: setTuning contestMarginDb={contest_margin_db} out of "
+                f"range [{MIN_CONTEST_MARGIN_DB}, {MAX_CONTEST_MARGIN_DB}]; dropping."
+            )
+            return
+
+        self._tuning = ElectionTuning(
+            hysteresis_db=float(hysteresis_db),
+            hysteresis_consecutive=int(consecutive_ticks),
+            contest_margin_db=float(contest_margin_db),
+        )
+        # ranging.detect_contest() reads this module-level global directly;
+        # keep it in lockstep so setTuning takes effect immediately without
+        # touching ranging.py's contest-detection algorithm.
+        ranging_mod.CONTEST_MARGIN_DB = float(contest_margin_db)
+        print(
+            f"[aggregator] TUNING updated hysteresisDb={hysteresis_db} "
+            f"consecutiveTicks={consecutive_ticks} contestMarginDb={contest_margin_db}"
+        )
 
     async def _broadcast_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -789,6 +1073,7 @@ class Aggregator:
             ranging_message = self._current_ranging_message()
             # rangingEvent is one-shot too.
             self._pending_ranging_event = None
+            position_message = self._current_position_message()
             if not self.clients:
                 # Even with no clients, clear the dirty flags so they don't
                 # queue up an unnecessary broadcast on the next connect.
@@ -806,6 +1091,11 @@ class Aggregator:
             # This keeps the wire quiet in the common uncontested case.
             if ranging_message is not None:
                 payloads.append(json.dumps(ranging_message))
+            # Only attach the position message when a fusion track exists for
+            # the current owner. This keeps the wire quiet for a fresh
+            # install with no placed layout (no track is ever created).
+            if position_message is not None:
+                payloads.append(json.dumps(position_message))
             self._conversation_dirty = False
             self._ranging_dirty = False
             stale = []
@@ -905,6 +1195,30 @@ class Aggregator:
             chirp=chirp_dict,
             fusion_reason=self._last_fusion_reason,
             ranging_event=self._pending_ranging_event,
+        )
+
+    def _current_position_message(self) -> dict | None:
+        """Build the Phase 10 position broadcast, or None if there's no
+        track yet for the current owner.
+
+        Mirrors _current_conversation_message/_current_ranging_message's
+        exact suppression style: before any layout is placed (or before the
+        first owner acquisition), there is no track, so this returns None
+        and the wire stays quiet - a fresh install with no placed layout
+        never emits a position message.
+        """
+        owner = self._owner
+        if owner is None:
+            return None
+        track = self._fusion_tracker.tracks.get(owner)
+        if track is None:
+            return None
+        x, y = track.position
+        return build_position_message(
+            user_id=owner,
+            x=x,
+            y=y,
+            uncertainty_radius_m=track.position_uncertainty_radius_m,
         )
 
     # -- Terminal readout ---------------------------------------------------
@@ -1095,7 +1409,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "dropped, fusion overrides it with chirp-room-containment - the "
             "Phase 4 wall demo. Default (flag absent): both contest parties in "
             "room at the documented distances (1.5m incumbent, 2.5m challenger). "
-            "Example: --ranging-geometry \"A=1.5:in,B=2.5:out\""
+            "Example: --ranging-geometry \"A=1.5:in,B=2.5:out\". Mutually "
+            "exclusive with --ranging-real-chirp (Phase 9)."
+        ),
+    )
+    parser.add_argument(
+        "--ranging-real-chirp",
+        default=None,
+        metavar="SCANNER_ID",
+        help=(
+            "Phase 9: use a REAL acoustic chirp (real_ranging_source.py) "
+            "instead of the synthetic/geometry ranging source, via this "
+            "process's local speaker+mic (sounddevice). SCANNER_ID names "
+            "which scanner id this local audio hardware represents in every "
+            "contest - see real_ranging_source.py's module docstring for the "
+            "single-mic physical model this implies. Mutually exclusive "
+            "with --ranging-geometry. Not verifiable by an agent without "
+            "real hardware in the same room - see docs/phase9/PRD.md."
         ),
     )
     return parser.parse_args(argv)
@@ -1103,10 +1433,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 async def main_async(args: argparse.Namespace) -> None:
     peer_urls, peer_offsets = parse_peer_urls(args.peers)
+    if args.ranging_geometry is not None and args.ranging_real_chirp is not None:
+        raise ValueError("--ranging-geometry and --ranging-real-chirp are mutually exclusive.")
     ranging_source = None
     if args.ranging_geometry is not None:
         geometry = parse_ranging_geometry(args.ranging_geometry)
         ranging_source = make_geometry_ranging_source(geometry)
+    elif args.ranging_real_chirp is not None:
+        from real_ranging_source import make_real_ranging_source
+
+        ranging_source = make_real_ranging_source(local_scanner_id=args.ranging_real_chirp)
     aggregator = Aggregator(
         peer_urls, args.host, args.port, args.tick_ms, peer_offsets, ranging_source=ranging_source
     )

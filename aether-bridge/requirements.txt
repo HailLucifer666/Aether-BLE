@@ -1,3 +1,12 @@
 bleak>=1.0,<2.0
 websockets>=14.0,<16.0
-edge-tts>=6.0
+cryptography>=42.0
+zeroconf>=0.130
+qrcode>=7.4
+requests>=2.31
+openwakeword>=0.6
+sounddevice>=0.4
+piper-tts>=1.4
+wyoming>=1.5
+numpy>=1.26
+scipy>=1.11

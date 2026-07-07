@@ -11,6 +11,7 @@ import type {
   HandoffPhase,
   MeshConnectionState,
   MeshHandoffLogEntry,
+  PositionMessage,
   RangingEvent,
   RangingMessage,
   ScannerEntry,
@@ -54,6 +55,13 @@ export interface UseElectionSocketResult {
   chirp: ChirpInfo | null;
   fusionReason: FusionReason;
   rangingEvent: RangingEvent | null;
+  // Phase 10: spatial fusion. positions holds the latest `position` message
+  // per userId (server-authoritative; never computed locally). The three
+  // send functions mirror sendWake/sendSay's exact style.
+  positions: Map<string, { x: number; y: number; uncertaintyRadiusM: number }>;
+  sendPlaceDevice: (scannerId: string, x: number, y: number) => void;
+  sendSetCalibration: (scannerId: string, rssiAt1m: number, pathLossExponent: number) => void;
+  sendSetTuning: (hysteresisDb: number, consecutiveTicks: number, contestMarginDb: number) => void;
 }
 
 function randomRequestId(): string {
@@ -96,6 +104,14 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
   const [fusionReason, setFusionReason] = useState<FusionReason>("ble-only");
   const [rangingEvent, setRangingEvent] = useState<RangingEvent | null>(null);
   const rangingEventTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Phase 10 spatial fusion: latest position per userId. A plain object map
+  // (not a Map instance) so React's setState reference-equality check works
+  // the same way as the rest of this hook's state; converted to a Map only
+  // at the return boundary for callers that prefer Map ergonomics.
+  const [positions, setPositions] = useState<
+    Map<string, { x: number; y: number; uncertaintyRadiusM: number }>
+  >(new Map());
 
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -232,6 +248,18 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
     }
   }, []);
 
+  const handlePositionMessage = useCallback((msg: PositionMessage) => {
+    setPositions((prev) => {
+      const next = new Map(prev);
+      next.set(msg.userId, {
+        x: msg.x,
+        y: msg.y,
+        uncertaintyRadiusM: msg.uncertaintyRadiusM,
+      });
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     if (!enabled) {
       if (retryTimerRef.current !== null) {
@@ -260,12 +288,13 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
 
       socket.onmessage = (event) => {
         if (cancelled) return;
-        let parsed: ElectionMessage | ConversationMessage | RangingMessage;
+        let parsed: ElectionMessage | ConversationMessage | RangingMessage | PositionMessage;
         try {
           parsed = JSON.parse(event.data as string) as
             | ElectionMessage
             | ConversationMessage
-            | RangingMessage;
+            | RangingMessage
+            | PositionMessage;
         } catch {
           return;
         }
@@ -275,6 +304,8 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
           handleConversationMessage(parsed);
         } else if (parsed.type === "ranging") {
           handleRangingMessage(parsed);
+        } else if (parsed.type === "position") {
+          handlePositionMessage(parsed);
         }
       };
 
@@ -305,7 +336,13 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
         wsRef.current = null;
       }
     };
-  }, [enabled, handleElectionMessage, handleConversationMessage, handleRangingMessage]);
+  }, [
+    enabled,
+    handleElectionMessage,
+    handleConversationMessage,
+    handleRangingMessage,
+    handlePositionMessage,
+  ]);
 
   // Reset all mesh-derived state whenever the socket is disabled, so
   // switching away and back to Mesh mode never shows stale data from a
@@ -330,6 +367,7 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
     setChirp(null);
     setFusionReason("ble-only");
     setRangingEvent(null);
+    setPositions(new Map());
     lastLoggedHandoffTickRef.current = null;
     loadedAudioSrcRef.current = null;
     resumeOffsetRef.current = 0;
@@ -372,6 +410,39 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
     socket.send(JSON.stringify({ type: "say", text: trimmed, requestId: randomRequestId() }));
   }, []);
 
+  // Phase 10 send functions, following sendWake/sendSay's exact style: a
+  // no-op when the socket isn't open, otherwise a single JSON.stringify send.
+  // The server re-validates and silently drops out-of-range values, but
+  // callers (Spatial/Setup/Signal Lab) still clamp client-side so the UI
+  // itself never sends nonsense.
+  const sendPlaceDevice = useCallback((scannerId: string, x: number, y: number) => {
+    const socket = wsRef.current;
+    if (socket === null || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: "placeDevice", scannerId, x, y }));
+  }, []);
+
+  const sendSetCalibration = useCallback(
+    (scannerId: string, rssiAt1m: number, pathLossExponent: number) => {
+      const socket = wsRef.current;
+      if (socket === null || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(
+        JSON.stringify({ type: "setCalibration", scannerId, rssiAt1m, pathLossExponent })
+      );
+    },
+    []
+  );
+
+  const sendSetTuning = useCallback(
+    (hysteresisDb: number, consecutiveTicks: number, contestMarginDb: number) => {
+      const socket = wsRef.current;
+      if (socket === null || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(
+        JSON.stringify({ type: "setTuning", hysteresisDb, consecutiveTicks, contestMarginDb })
+      );
+    },
+    []
+  );
+
   return {
     connection,
     owner,
@@ -392,5 +463,9 @@ export function useElectionSocket(enabled: boolean): UseElectionSocketResult {
     chirp,
     fusionReason,
     rangingEvent,
+    positions,
+    sendPlaceDevice,
+    sendSetCalibration,
+    sendSetTuning,
   };
 }

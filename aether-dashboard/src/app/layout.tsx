@@ -1,10 +1,16 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import ServiceWorkerRegistration from "./ServiceWorkerRegistration";
 
 export const metadata: Metadata = {
-  title: "Aether Protocol v0.1",
+  title: "Aether",
   description:
-    "Cross-Device AI Arbitration — the conversation follows you between devices.",
+    "Aether spatial mesh dashboard — floor plan, live position, signal lab, timeline, and setup wizard.",
+  manifest: "/manifest.json",
+};
+
+export const viewport = {
+  themeColor: "#0a0f1e",
 };
 
 export default function RootLayout({
@@ -15,6 +21,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className="bg-slate-950 text-slate-100 antialiased">
+        <ServiceWorkerRegistration />
         {children}
       </body>
     </html>

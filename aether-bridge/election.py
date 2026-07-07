@@ -19,8 +19,38 @@ Election rule summary:
 
 from dataclasses import dataclass, replace
 
-HYSTERESIS_DB = 5.0
-HYSTERESIS_CONSECUTIVE = 2
+
+@dataclass
+class ElectionTuning:
+    """Mutable live-tunable election parameters.
+
+    Field defaults equal the original module-level constants
+    (HYSTERESIS_DB/HYSTERESIS_CONSECUTIVE) so behavior is unchanged unless a
+    caller explicitly overrides an instance's fields (Phase 10's `setTuning`
+    message, applied by aggregator.py). `contest_margin_db` is included here
+    too since it is tuned alongside the hysteresis parameters even though the
+    contest-detection algorithm itself lives in ranging.py - see
+    ranging.CONTEST_MARGIN_DB, which aggregator.py overrides in lockstep with
+    this dataclass's contest_margin_db field via module-attribute assignment
+    (ranging.py's own contest-detection logic is unchanged).
+
+    elect()'s comparison/hysteresis algorithm is untouched by this change -
+    it now reads HYSTERESIS_DB/HYSTERESIS_CONSECUTIVE from a passed-in
+    ElectionTuning instance (defaulting to DEFAULT_TUNING below) instead of
+    the bare module constants.
+    """
+
+    hysteresis_db: float = 5.0
+    hysteresis_consecutive: int = 2
+    contest_margin_db: float = 3.0
+
+
+# Default tuning instance, and module-level aliases pointing at its default
+# values so any existing code/tests importing the old bare constants keep
+# working unchanged.
+DEFAULT_TUNING = ElectionTuning()
+HYSTERESIS_DB = DEFAULT_TUNING.hysteresis_db
+HYSTERESIS_CONSECUTIVE = DEFAULT_TUNING.hysteresis_consecutive
 
 
 @dataclass(frozen=True)
@@ -83,8 +113,14 @@ def elect(
     current_owner: str | None,
     scanners: list[ScannerState],
     challenger: ChallengerState,
+    tuning: ElectionTuning = DEFAULT_TUNING,
 ) -> ElectResult:
-    """Run one election tick and return the resulting owner/challenger/handoff state."""
+    """Run one election tick and return the resulting owner/challenger/handoff state.
+
+    `tuning` supplies HYSTERESIS_DB/HYSTERESIS_CONSECUTIVE (defaulting to
+    DEFAULT_TUNING, i.e. the original constants) - the arbitration algorithm
+    itself is unchanged, only where these two numbers come from.
+    """
     candidates = [s for s in scanners if _is_candidate(s)]
 
     if not candidates:
@@ -112,7 +148,7 @@ def elect(
     exceeds_hysteresis = (
         challenger_rssi is not None
         and incumbent_rssi is not None
-        and challenger_rssi - incumbent_rssi >= HYSTERESIS_DB
+        and challenger_rssi - incumbent_rssi >= tuning.hysteresis_db
     )
 
     if not exceeds_hysteresis:
@@ -125,7 +161,7 @@ def elect(
         # A different scanner is now the strongest challenger: streak resets.
         streak = 1
 
-    if streak >= HYSTERESIS_CONSECUTIVE:
+    if streak >= tuning.hysteresis_consecutive:
         handoff = Handoff(from_id=incumbent.id, to_id=strongest_other.id)
         return ElectResult(new_owner=strongest_other.id, challenger=ChallengerState(), handoff=handoff)
 

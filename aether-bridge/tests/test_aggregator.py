@@ -587,29 +587,139 @@ def test_say_with_no_owner_is_ignored():
     run(inner())
 
 
-def test_say_synthetic_fallback_when_edge_tts_missing(monkeypatch):
-    """When edge_tts can't be imported, _handle_say falls back to a synthetic
-    utterance (no audio, duration estimated from text length) and still
-    drives the same conversation FSM. This is the path exercised in every
-    CI/test environment where edge_tts isn't installed."""
+def _ollama_reachable() -> bool:
+    """Best-effort check for a running local Ollama instance, so the "ask"
+    integration test below skips cleanly (rather than failing the whole
+    suite) in an environment where Ollama isn't running - same skip-clean
+    contract llm.py's own generate_reply call is expected to honor."""
+    import requests
+
+    try:
+        requests.get("http://localhost:11434/api/tags", timeout=1.0)
+        return True
+    except requests.RequestException:
+        return False
+
+
+@pytest.mark.skipif(not _ollama_reachable(), reason="local Ollama instance not reachable at http://localhost:11434")
+def test_ask_generates_llm_reply_and_assigns_to_owner():
+    """Phase 8: an inbound 'ask' message drives llm.generate_reply against
+    the REAL running Ollama instance (not mocked - per this project's Prime
+    Directive of verifying by actually running things), then feeds the reply
+    into the existing _handle_say pipeline so it becomes an utterance owned
+    by the current elected owner, exactly like the manual 'say' path."""
 
     async def inner():
         url, push, peer_server = await _start_peer("SIM-A")
         agg, port, stop = await _start_aggregator([url], tick_ms=50)
 
-        # Force the lazy edge_tts import inside _generate_speech to fail.
-        real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+        try:
+            await _drain_peer_connections(agg, 1)
+            await asyncio.sleep(0.15)
+            assert agg._owner == "SIM-A"
 
-        def blocking_import(name, *args, **kwargs):
-            if name == "edge_tts":
-                raise ImportError("simulated: edge_tts not installed")
-            return real_import(name, *args, **kwargs)
+            await agg._handle_ask("What is the capital of France? Answer in one short sentence.")
 
-        # The import happens inside _generate_speech; patch builtins.import
-        # used by that function. We use the module's own import context.
-        import builtins
-        original_import = builtins.__import__
-        monkeypatch.setattr(builtins, "__import__", blocking_import)
+            conv = agg._conversation
+            assert conv.utterance is not None, "ask must produce an utterance via the say pipeline"
+            assert conv.speaking_scanner == "SIM-A", "utterance must be owned by the current elected owner"
+            # Two transcript entries: the LLM reply text (role=assistant) -
+            # _handle_ask only feeds _handle_say the generated reply, mirroring
+            # the manual say path's behavior (no separate user-turn entry).
+            assert len(conv.transcript) == 1
+            assert conv.transcript[0].role == "assistant"
+            assert isinstance(conv.transcript[0].text, str) and len(conv.transcript[0].text) > 0
+            # Duration/audio came through _generate_speech (Piper or its
+            # synthetic fallback) exactly like "say" - both are valid here.
+            assert conv.utterance.duration_ms > 0
+        finally:
+            await stop()
+            peer_server.close()
+            await peer_server.wait_closed()
+
+    run(inner())
+
+
+@pytest.mark.skipif(not _ollama_reachable(), reason="local Ollama instance not reachable at http://localhost:11434")
+def test_ask_with_empty_text_is_ignored():
+    """An inbound ask with empty/whitespace text must not call the LLM or
+    start an utterance - mirrors test_say_with_empty_text_is_ignored."""
+
+    async def inner():
+        url, push, peer_server = await _start_peer("SIM-A")
+        agg, port, stop = await _start_aggregator([url], tick_ms=50)
+
+        try:
+            await _drain_peer_connections(agg, 1)
+            await asyncio.sleep(0.15)
+
+            await agg._handle_ask("   ")
+            assert agg._conversation.utterance is None
+            assert agg._conversation.transcript == ()
+        finally:
+            await stop()
+            peer_server.close()
+            await peer_server.wait_closed()
+
+    run(inner())
+
+
+def test_ask_falls_back_to_fallback_reply_when_llm_fails(monkeypatch):
+    """When llm.generate_reply raises (Ollama down, network error, etc.),
+    _handle_ask must fall back to llm.FALLBACK_REPLY and still drive the say
+    pipeline, rather than dropping the ask or crashing the aggregator - no
+    real Ollama call needed for this path, so it always runs."""
+
+    async def inner():
+        url, push, peer_server = await _start_peer("SIM-A")
+        agg, port, stop = await _start_aggregator([url], tick_ms=50)
+
+        import llm as llm_module_ref
+
+        def failing_generate_reply(transcript_context, text, **kwargs):
+            raise llm_module_ref.LLMError("simulated: Ollama unreachable")
+
+        monkeypatch.setattr(llm_module_ref, "generate_reply", failing_generate_reply)
+
+        try:
+            await _drain_peer_connections(agg, 1)
+            await asyncio.sleep(0.15)
+
+            await agg._handle_ask("hello aether")
+
+            conv = agg._conversation
+            assert conv.utterance is not None
+            assert conv.transcript[0].text == llm_module_ref.FALLBACK_REPLY
+            assert conv.speaking_scanner == "SIM-A"
+        finally:
+            await stop()
+            peer_server.close()
+            await peer_server.wait_closed()
+
+    run(inner())
+
+
+def test_say_synthetic_fallback_when_piper_fails(monkeypatch):
+    """When Piper synthesis fails (model missing, subprocess/inference error),
+    _handle_say falls back to a synthetic utterance (no audio, duration
+    estimated from text length) and still drives the same conversation FSM.
+    Phase 8: replaces the old edge_tts-import-failure test now that
+    _generate_speech's primary path is Piper (see piper_tts.py); the
+    resilience contract (TTS failure never crashes the aggregator or blocks
+    the FSM) is unchanged."""
+
+    async def inner():
+        url, push, peer_server = await _start_peer("SIM-A")
+        agg, port, stop = await _start_aggregator([url], tick_ms=50)
+
+        # Force the Piper synthesis call inside _generate_speech to fail.
+        import aggregator as agg_module_ref
+        from piper_tts import PiperTTSError
+
+        def failing_synthesize_pcm(text):
+            raise PiperTTSError("simulated: Piper model unavailable")
+
+        monkeypatch.setattr(agg_module_ref, "synthesize_pcm", failing_synthesize_pcm)
 
         try:
             await _drain_peer_connections(agg, 1)
@@ -1101,6 +1211,336 @@ def test_ranging_message_envelope_shape():
             for s in (srv_a, srv_b):
                 s.close()
                 await s.wait_closed()
+
+    run(inner())
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: placeDevice / setCalibration / setTuning message handlers +
+# position broadcast.
+# ---------------------------------------------------------------------------
+
+def test_place_device_valid_input_updates_layout(tmp_path):
+    """A valid placeDevice message writes through to the LayoutStore."""
+
+    async def inner():
+        from layout import LayoutStore
+
+        url, push, peer_server = await _start_peer("SIM-A")
+        layout_store = LayoutStore(path=tmp_path / "layout.json")
+        agg = Aggregator([url], "127.0.0.1", 0, 50, layout_store=layout_store)
+        server = await websockets.serve(agg._handle_client, "127.0.0.1", 0)
+        tasks = [
+            asyncio.ensure_future(agg._peer_connection_loop(url)),
+            asyncio.ensure_future(agg._election_tick_loop()),
+            asyncio.ensure_future(agg._broadcast_loop()),
+        ]
+
+        try:
+            await _drain_peer_connections(agg, 1)
+            await agg._handle_inbound_client_message(
+                json.dumps({"type": "placeDevice", "scannerId": "SIM-A", "x": 1.5, "y": 2.5})
+            )
+            positions = agg._layout.get_scanner_positions()
+            assert positions == {"SIM-A": (1.5, 2.5)}
+        finally:
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+            server.close()
+            await server.wait_closed()
+            peer_server.close()
+            await peer_server.wait_closed()
+
+    run(inner())
+
+
+def test_place_device_out_of_bounds_is_dropped_without_crashing(tmp_path):
+    """An out-of-bounds placeDevice must be dropped (no state mutation, no
+    exception escaping the inbound handler)."""
+
+    async def inner():
+        from layout import LayoutStore, MAX_COORDINATE_METERS
+
+        url, push, peer_server = await _start_peer("SIM-A")
+        layout_store = LayoutStore(path=tmp_path / "layout.json")
+        agg = Aggregator([url], "127.0.0.1", 0, 50, layout_store=layout_store)
+
+        try:
+            await agg._handle_inbound_client_message(
+                json.dumps(
+                    {
+                        "type": "placeDevice",
+                        "scannerId": "SIM-A",
+                        "x": MAX_COORDINATE_METERS + 1.0,
+                        "y": 0.0,
+                    }
+                )
+            )
+            assert agg._layout.get_scanner_positions() == {}
+        finally:
+            peer_server.close()
+            await peer_server.wait_closed()
+
+    run(inner())
+
+
+def test_place_device_malformed_types_are_dropped(tmp_path):
+    """Non-numeric x/y and missing scannerId must be dropped, not crash."""
+
+    async def inner():
+        from layout import LayoutStore
+
+        layout_store = LayoutStore(path=tmp_path / "layout.json")
+        agg = Aggregator([], "127.0.0.1", 0, 50, layout_store=layout_store)
+
+        await agg._handle_inbound_client_message(
+            json.dumps({"type": "placeDevice", "scannerId": "SIM-A", "x": "far", "y": 1.0})
+        )
+        await agg._handle_inbound_client_message(
+            json.dumps({"type": "placeDevice", "x": 1.0, "y": 1.0})
+        )
+        assert agg._layout.get_scanner_positions() == {}
+
+    run(inner())
+
+
+def test_set_calibration_valid_input_updates_layout(tmp_path):
+    async def inner():
+        from layout import LayoutStore
+
+        layout_store = LayoutStore(path=tmp_path / "layout.json")
+        agg = Aggregator([], "127.0.0.1", 0, 50, layout_store=layout_store)
+
+        await agg._handle_inbound_client_message(
+            json.dumps(
+                {
+                    "type": "setCalibration",
+                    "scannerId": "SIM-A",
+                    "rssiAt1m": -59.0,
+                    "pathLossExponent": 2.5,
+                }
+            )
+        )
+        calibration = agg._layout.get_calibration("SIM-A")
+        assert calibration is not None
+        assert calibration.rssi_at_1m == -59.0
+        assert calibration.path_loss_exponent == 2.5
+
+    run(inner())
+
+
+def test_set_calibration_out_of_range_is_dropped(tmp_path):
+    async def inner():
+        from layout import LayoutStore
+
+        layout_store = LayoutStore(path=tmp_path / "layout.json")
+        agg = Aggregator([], "127.0.0.1", 0, 50, layout_store=layout_store)
+
+        await agg._handle_inbound_client_message(
+            json.dumps(
+                {
+                    "type": "setCalibration",
+                    "scannerId": "SIM-A",
+                    "rssiAt1m": 500.0,  # far outside sane dBm range
+                    "pathLossExponent": 2.0,
+                }
+            )
+        )
+        assert agg._layout.get_calibration("SIM-A") is None
+
+    run(inner())
+
+
+def test_set_tuning_valid_input_updates_tuning_and_ranging_margin():
+    async def inner():
+        import ranging as ranging_mod
+
+        agg = Aggregator([], "127.0.0.1", 0, 50)
+        original_margin = ranging_mod.CONTEST_MARGIN_DB
+        try:
+            await agg._handle_inbound_client_message(
+                json.dumps(
+                    {
+                        "type": "setTuning",
+                        "hysteresisDb": 8.0,
+                        "consecutiveTicks": 3,
+                        "contestMarginDb": 4.0,
+                    }
+                )
+            )
+            assert agg._tuning.hysteresis_db == 8.0
+            assert agg._tuning.hysteresis_consecutive == 3
+            assert agg._tuning.contest_margin_db == 4.0
+            assert ranging_mod.CONTEST_MARGIN_DB == 4.0
+        finally:
+            ranging_mod.CONTEST_MARGIN_DB = original_margin
+
+    run(inner())
+
+
+def test_set_tuning_out_of_range_is_dropped_and_never_crashes():
+    async def inner():
+        import ranging as ranging_mod
+        from election import ElectionTuning
+
+        agg = Aggregator([], "127.0.0.1", 0, 50)
+        default_tuning = ElectionTuning()
+        original_margin = ranging_mod.CONTEST_MARGIN_DB
+        try:
+            # hysteresisDb out of [0, 20].
+            await agg._handle_inbound_client_message(
+                json.dumps(
+                    {
+                        "type": "setTuning",
+                        "hysteresisDb": 999.0,
+                        "consecutiveTicks": 3,
+                        "contestMarginDb": 4.0,
+                    }
+                )
+            )
+            # consecutiveTicks not a positive int.
+            await agg._handle_inbound_client_message(
+                json.dumps(
+                    {
+                        "type": "setTuning",
+                        "hysteresisDb": 8.0,
+                        "consecutiveTicks": 0,
+                        "contestMarginDb": 4.0,
+                    }
+                )
+            )
+            # contestMarginDb negative.
+            await agg._handle_inbound_client_message(
+                json.dumps(
+                    {
+                        "type": "setTuning",
+                        "hysteresisDb": 8.0,
+                        "consecutiveTicks": 3,
+                        "contestMarginDb": -1.0,
+                    }
+                )
+            )
+            # Malformed type.
+            await agg._handle_inbound_client_message(
+                json.dumps(
+                    {
+                        "type": "setTuning",
+                        "hysteresisDb": "loud",
+                        "consecutiveTicks": 3,
+                        "contestMarginDb": 4.0,
+                    }
+                )
+            )
+            assert agg._tuning.hysteresis_db == default_tuning.hysteresis_db
+            assert agg._tuning.hysteresis_consecutive == default_tuning.hysteresis_consecutive
+            assert agg._tuning.contest_margin_db == default_tuning.contest_margin_db
+            assert ranging_mod.CONTEST_MARGIN_DB == original_margin
+        finally:
+            ranging_mod.CONTEST_MARGIN_DB = original_margin
+
+    run(inner())
+
+
+def test_position_message_absent_before_layout_is_placed():
+    """With no scanner positions ever placed, no track can form, so
+    _current_position_message stays None even once a scanner is elected
+    owner - mirrors the conversation/ranging suppression pattern."""
+
+    async def inner():
+        url, push, peer_server = await _start_peer("SIM-A")
+        agg, port, stop = await _start_aggregator([url], tick_ms=50)
+
+        try:
+            await _drain_peer_connections(agg, 1)
+            await asyncio.sleep(0.2)
+            assert agg._owner == "SIM-A"
+            assert agg._current_position_message() is None
+
+            async with websockets.connect(f"ws://127.0.0.1:{port}") as client:
+                saw_types = set()
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 1.0
+                while loop.time() < deadline:
+                    try:
+                        raw = await asyncio.wait_for(client.recv(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        break
+                    msg = json.loads(raw)
+                    saw_types.add(msg.get("type"))
+                assert "position" not in saw_types
+        finally:
+            await stop()
+            peer_server.close()
+            await peer_server.wait_closed()
+
+    run(inner())
+
+
+def test_position_message_shape_once_track_exists(tmp_path):
+    """Once a scanner is placed and calibrated, the election tick loop feeds
+    the FusionTracker, and the position broadcast carries the locked schema
+    {type, userId, x, y, uncertaintyRadiusM}."""
+
+    async def inner():
+        from layout import LayoutStore
+
+        url, push, peer_server = await _start_peer("SIM-A", -55.0)
+        layout_store = LayoutStore(path=tmp_path / "layout.json")
+        layout_store.set_position("SIM-A", 0.0, 0.0)
+        layout_store.set_calibration("SIM-A", rssi_at_1m=-55.0, path_loss_exponent=2.0)
+
+        agg = Aggregator([url], "127.0.0.1", 0, 50, layout_store=layout_store)
+        server = await websockets.serve(agg._handle_client, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        tasks = [
+            asyncio.ensure_future(agg._peer_connection_loop(url)),
+            asyncio.ensure_future(agg._election_tick_loop()),
+            asyncio.ensure_future(agg._conversation_fsm_loop()),
+            asyncio.ensure_future(agg._broadcast_loop()),
+        ]
+
+        try:
+            await _drain_peer_connections(agg, 1)
+            await asyncio.sleep(0.3)  # let the election tick loop feed fusion
+
+            async with websockets.connect(f"ws://127.0.0.1:{port}") as client:
+                saw_position = False
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 3.0
+                while loop.time() < deadline and not saw_position:
+                    try:
+                        raw = await asyncio.wait_for(client.recv(), timeout=0.3)
+                    except asyncio.TimeoutError:
+                        continue
+                    msg = json.loads(raw)
+                    if msg.get("type") != "position":
+                        continue
+                    saw_position = True
+                    assert set(msg.keys()) == {"type", "userId", "x", "y", "uncertaintyRadiusM"}
+                    assert msg["userId"] == "SIM-A"
+                    assert isinstance(msg["x"], (int, float))
+                    assert isinstance(msg["y"], (int, float))
+                    assert isinstance(msg["uncertaintyRadiusM"], (int, float))
+                assert saw_position, "never received a position broadcast"
+        finally:
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+            for client in list(agg.clients):
+                await client.close()
+            server.close()
+            await server.wait_closed()
+            peer_server.close()
+            await peer_server.wait_closed()
 
     run(inner())
 

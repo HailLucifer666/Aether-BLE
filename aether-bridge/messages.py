@@ -115,6 +115,30 @@ def build_conversation_message(
     }
 
 
+def build_hello_message(ver: int, node_id: str, capabilities: list[str], sig: str) -> dict:
+    """Build the `hello` handshake message (Phase 6 addition).
+
+    Sent bidirectionally on connect, before any other message. Purely
+    additive - existing message types/consumers are unaffected (§8
+    Versioning: unrecognized types are ignored by older peers).
+
+        {"type": "hello", "ver": 1, "node_id": "a1b2c3d4e5f6a7b8",
+         "capabilities": ["beacon", "ranging"], "sig": "<hex signature>",
+         "ts": "14:32:41"}
+
+    `sig` is the sender's Ed25519 signature (hex-encoded) over the handshake
+    payload, allowing the receiver to authenticate the sender's identity.
+    """
+    return {
+        "type": "hello",
+        "ver": ver,
+        "node_id": node_id,
+        "capabilities": capabilities,
+        "sig": sig,
+        "ts": _now_hms(),
+    }
+
+
 def build_ranging_message(
     contest: dict | None,
     chirp: dict | None,
@@ -160,4 +184,28 @@ def build_ranging_message(
         "chirp": chirp,
         "fusionReason": fusion_reason,
         "rangingEvent": ranging_event,
+    }
+
+
+def build_position_message(
+    user_id: str, x: float, y: float, uncertainty_radius_m: float
+) -> dict:
+    """Build the 2-D fusion position broadcast message (Phase 10).
+
+    Sent as a separate JSON message on the same WebSocket as the election/
+    conversation/ranging broadcasts, one per tracked user with an active
+    fusion_2d.py track. Additive schema - existing contracts are untouched:
+
+        {"type": "position", "userId": "SIM-A", "x": 1.23, "y": 4.56,
+         "uncertaintyRadiusM": 0.8}
+
+    Omitted entirely (not sent) by the caller when no track exists yet -
+    see Aggregator._current_position_message.
+    """
+    return {
+        "type": "position",
+        "userId": user_id,
+        "x": x,
+        "y": y,
+        "uncertaintyRadiusM": uncertainty_radius_m,
     }
