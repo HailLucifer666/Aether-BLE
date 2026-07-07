@@ -375,14 +375,43 @@ and `conversation` alone (§3).
 
 ## 8. Versioning and compatibility
 
-Aether has no version-negotiation handshake. Compatibility is maintained by a
-strict rule: **new message types and new optional fields may be added at any
-time; existing field names, types, and semantics defined in this document
-MUST NOT change.** A conformant implementation ignores unrecognized `"type"`
-values and unrecognized fields on known types (§3) — this is what makes the
-tier-2 ranging extension (§7) safe to add without breaking a client built
-against §5–6 alone, and is the same discipline any future extension must
-follow.
+Prior to Phase 6, Aether had no version-negotiation handshake. Compatibility
+is maintained by a strict rule: **new message types and new optional fields
+may be added at any time; existing field names, types, and semantics defined
+in this document MUST NOT change.** A conformant implementation ignores
+unrecognized `"type"` values and unrecognized fields on known types (§3) —
+this is what makes the tier-2 ranging extension (§7) safe to add without
+breaking a client built against §5–6 alone, and is the same discipline any
+future extension must follow.
+
+### 8.1 `hello` — version and capability handshake (Phase 6 addition)
+
+Sent bidirectionally, once, immediately after a connection is established and
+before any other message type. Purely additive per the rule above — a peer
+that does not understand `"type": "hello"` simply ignores it and continues
+functioning on the message types it does understand.
+
+```json
+{
+  "type": "hello",
+  "ver": 1,
+  "node_id": "a1b2c3d4e5f6a7b8",
+  "capabilities": ["beacon", "ranging"],
+  "sig": "3045022100...",
+  "ts": "14:32:41"
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `ver` | integer | Protocol version this node speaks. |
+| `node_id` | string | Stable fingerprint of the sender's Ed25519 public key (see Security Annex, §11.1). |
+| `capabilities` | array of string | Feature tags the sender supports (e.g. `"beacon"`, `"ranging"`), allowing a receiver to adapt without a version number alone. |
+| `sig` | string (hex) | Ed25519 signature over the handshake payload, authenticating `node_id`'s claimed identity. |
+
+`hello` establishes identity and capabilities; it does not itself gate
+whether `reading`/`election`/`conversation`/`ranging` messages are accepted —
+those contracts are unchanged by this addition.
 
 ## 9. Reference implementation map
 
@@ -393,6 +422,8 @@ follow.
 | §6 Aggregator/client contract | `aether-bridge/aggregator.py`, `aether-bridge/messages.py` |
 | §6.3 Conversation FSM | `aether-bridge/conversation.py` |
 | §7 Tier-2 ranging | `aether-bridge/ranging.py` |
+| §8.1 `hello` handshake | `aether-bridge/messages.py`, `aether-bridge/identity.py` |
+| §11 Security Annex | `aether-bridge/beacon_auth.py`, `aether-bridge/realm.py`, `aether-bridge/identity.py`, `aether-bridge/pairing.py`, `aether-bridge/discovery.py` |
 | Client rendering | `aether-dashboard/src/app/mesh/` |
 
 ## 10. Non-goals (explicitly out of scope)
@@ -400,9 +431,114 @@ follow.
 - Wake-word detection, speech-to-text, dialogue generation, and text-to-speech
   are not specified here — Aether decides *who* should handle an interaction,
   not *how* it's handled.
-- Authentication/authorization between scanners, aggregator, and clients is
-  not specified. The reference implementation assumes a trusted local
-  network; production deployments crossing a trust boundary need to add this
-  independently.
-- Service discovery is not specified — the reference implementation uses a
-  static, operator-supplied peer list.
+- Transport encryption (TLS/Noise) between scanners, aggregator, and clients
+  is not specified — see §11.4. The reference implementation assumes a
+  trusted local network; production deployments crossing a trust boundary
+  need to add this independently.
+- Multi-user beacon ownership is not specified — the `uid_hash` field in the
+  beacon payload (§11.2) exists for future use, but election/ownership logic
+  (§5) remains single-user.
+- Key-loss recovery is not specified — a lost or corrupted identity/realm key
+  requires re-running the pairing ceremony (§11.3); no backup/export flow is
+  part of this protocol.
+
+## 11. Security Annex (Phase 6)
+
+This section specifies the beacon-authentication and node-identity mechanisms
+introduced in Phase 6. It does not change any message schema defined in §4–7.
+
+### 11.1 Node identity
+
+Each node generates an Ed25519 keypair on first run and persists it locally
+(reference implementation: `~/.aether/identity.json`). A node's `node_id` is
+a fingerprint of its public key: `sha256(pubkey)`, hex-encoded, truncated to
+16 hex characters (64 bits). This is used in the `hello` handshake (§8.1) and
+in mDNS TXT records (§11.5).
+
+### 11.2 Authenticated beacon payload
+
+To prevent a plaintext advertised-name match from being trivially spoofed or
+replayed, the beacon advertises a fixed 19-byte authenticated payload instead
+of relying solely on its advertised name, carried in the BLE manufacturer-data
+field:
+
+```
+[2B magic | 1B ver | 4B uid_hash | 4B counter | 8B HMAC-SHA256(realm_key, uid_hash || counter)]
+```
+
+| Field | Size | Meaning |
+|---|---|---|
+| `magic` | 2 bytes | Fixed marker identifying this as an Aether beacon payload. |
+| `ver` | 1 byte | Payload format version. |
+| `uid_hash` | 4 bytes, big-endian | Identifies the beacon (single-user this phase — see §10). |
+| `counter` | 4 bytes, big-endian | Strictly increasing per-beacon nonce. |
+| `mac` | 8 bytes | First 8 bytes of `HMAC-SHA256(realm_key, uid_hash‖counter)` — truncated to fit the BLE manufacturer-data budget. |
+
+A receiver (scanner) MUST reject a payload if any of the following hold:
+
+- The payload is not exactly 19 bytes, or the magic/version fields don't match
+  a supported value.
+- `counter <= last_accepted_counter` for that `uid_hash` (replay or stale —
+  counters are strictly increasing, equal counters are rejected, not just
+  lower ones).
+- The received MAC does not match `HMAC-SHA256(realm_key, uid_hash‖counter)`
+  recomputed locally (spoofed or corrupted payload).
+
+A rejected payload MUST be dropped silently (no propagation into the
+`reading`/`election` flow) and SHOULD be logged at debug level only — a
+malicious or malfunctioning nearby device broadcasting garbage on this
+channel is expected background noise, not something that should spam an
+operator's terminal.
+
+**Counter persistence:** the last-accepted counter per `uid_hash` MUST be
+persisted to local disk (reference implementation:
+`~/.aether/beacon_counter.json`) and reloaded on startup. A process or device
+restart MUST NOT reset the counter to zero — doing so would reopen a replay
+window for every payload broadcast before the restart.
+
+### 11.3 Realm key, versioning, and rotation
+
+A "realm" is the shared secret admitting nodes to one mesh. The realm key is
+a 256-bit value used as the HMAC key in §11.2. It is versioned
+(`realm_key_v`, an incrementing integer) so it can be rotated without a
+mesh-wide simultaneous update: verification is accepted against any of the
+last N key versions (reference implementation: N=3) — a "grace window" that
+tolerates a beacon or scanner briefly running the previous key version across
+a rotation. Versions older than the grace window are pruned and no longer
+accepted.
+
+New nodes are admitted to a realm via the QR pairing ceremony (§11.4), not by
+any in-band protocol message — realm membership is an out-of-band trust
+decision, not something a peer can request over the wire.
+
+### 11.4 Explicit LAN-trust assumption (transport encryption deferred)
+
+**Transport encryption (TLS/Noise) is explicitly deferred, not forgotten.**
+All WebSocket traffic in §3–7 (scanner↔aggregator, aggregator↔client) remains
+plaintext in this phase, exactly as before Phase 6. The mechanisms in this
+annex authenticate and replay-protect the *beacon* advertisement channel
+specifically; they do not encrypt or authenticate the WebSocket transport.
+
+This is a deliberate, scoped decision for a solo-operator single-realm
+deployment on a trusted home LAN — not a claim that the protocol is secure
+against a network-level attacker. Any deployment crossing a trust boundary
+(untrusted network, multi-tenant environment, internet-facing) MUST add
+transport encryption before relying on this protocol; that hardening is
+tracked for a later phase and is out of scope here.
+
+### 11.5 Pairing and discovery (informative — not wire-protocol-normative)
+
+New nodes join a realm via a QR-code ceremony: the admitting node displays a
+QR encoding `{pubkey, mdns_name, realm_invite_token}`; the joining device
+scans it and performs a mutual Ed25519 key exchange over a short-lived local
+listener. This ceremony is a local, out-of-band bootstrap step, not a
+WebSocket message type, so it has no wire-format entry in §3–8.
+
+Peer discovery uses mDNS (`_aether._tcp.local`) in place of a static,
+operator-supplied peer list. This replaces the peer-list mechanism referenced
+in §10 of prior versions of this document; it is a discovery mechanism, not a
+protocol message, and does not change §4–7.
+
+**Key loss:** if a node's identity or realm key is lost or corrupted, the
+only recovery is re-running the pairing ceremony. No backup/export flow is
+provided or specified.

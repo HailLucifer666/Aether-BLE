@@ -11,6 +11,7 @@ with no browser connected.
 import argparse
 import asyncio
 import json
+import logging
 import signal
 import sys
 from dataclasses import dataclass
@@ -20,13 +21,22 @@ from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
+from beacon_auth import BeaconCounterStore, uid_hash_from_name, verify_beacon_any_key
 from messages import build_lost_message, build_reading_message
+from realm import load_or_create_realm
 from smoothing import apply_ema
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TARGET_NAME = "OnePlus 7T"
 DEFAULT_SCANNER_ID = "PC"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+
+# Bluetooth SIG reserves 0xFFFF for internal/interoperability testing (not a
+# registered Company Identifier) - appropriate for this project's
+# manufacturer-data channel since Aether is not an SIG-registered company.
+AETHER_MFG_ID = 0xFFFF
 
 # Windows' WinRT BLE scanning stack uses a hardcoded ~118ms scan interval with
 # an ~18ms scan window (~15% duty cycle) that no application can adjust, and
@@ -59,14 +69,6 @@ SCANNER_STALL_CHECK_INTERVAL_SECONDS = 1.0
 BAR_WIDTH = 40
 BAR_MIN_RSSI = -100
 BAR_MAX_RSSI = -30
-
-
-def _raw_name(device: BLEDevice, adv: AdvertisementData) -> str | None:
-    if adv.local_name:
-        return adv.local_name
-    if device.name:
-        return device.name
-    return None
 
 
 @dataclass
@@ -108,6 +110,9 @@ class Bridge:
         host: str,
         port: int,
         lost_threshold_seconds: float = DEFAULT_LOST_THRESHOLD_SECONDS,
+        realm_key: bytes | None = None,
+        counter_store: BeaconCounterStore | None = None,
+        key_history: list[bytes] | None = None,
     ) -> None:
         self.target_name = target_name
         self.target_name_lower = target_name.lower()
@@ -115,6 +120,29 @@ class Bridge:
         self.host = host
         self.port = port
         self.lost_threshold_seconds = lost_threshold_seconds
+
+        # Authenticated-beacon verification (Phase 6). realm_key/counter_store
+        # are injectable for tests; production defaults come from the local
+        # realm file and the on-disk persisted counter (see beacon_auth.py /
+        # realm.py and PROTOCOL.md Security Annex).
+        #
+        # candidate_keys carries the grace window: a beacon signed just
+        # before a realm key rotation must still verify against the
+        # previous key(s), not only the current one (PROTOCOL.md Security
+        # Annex "grace window"). When realm_key is injected explicitly (as
+        # tests do) and key_history isn't also given, the candidate list is
+        # just that one key - identical to pre-fix behavior. In production
+        # (no injection), the full realm.key_history is used so rotation
+        # doesn't lock out in-flight beacons.
+        self.uid_hash = uid_hash_from_name(target_name)
+        if realm_key is not None:
+            self.realm_key = realm_key
+            self.candidate_keys = key_history if key_history is not None else [realm_key]
+        else:
+            realm = load_or_create_realm()
+            self.realm_key = realm.current_key
+            self.candidate_keys = key_history if key_history is not None else list(realm.key_history.values())
+        self.counter_store = counter_store if counter_store is not None else BeaconCounterStore()
 
         self.state = BeaconState()
         self.clients: set[websockets.asyncio.server.ServerConnection] = set()
@@ -135,9 +163,20 @@ class Bridge:
     def _on_advertisement(self, device: BLEDevice, adv: AdvertisementData) -> None:
         self._last_any_advertisement_monotonic = asyncio.get_running_loop().time()
 
-        raw = _raw_name(device, adv)
-        if raw is None or raw.lower() != self.target_name_lower:
+        payload = adv.manufacturer_data.get(AETHER_MFG_ID)
+        if payload is None:
             return
+
+        last_counter = self.counter_store.get_last_counter(self.uid_hash)
+        result = verify_beacon_any_key(payload, self.candidate_keys, last_counter)
+        if not result.ok:
+            logger.debug("dropped beacon advertisement: %s", result.reason)
+            return
+        if result.uid_hash != self.uid_hash:
+            logger.debug("dropped beacon advertisement: uid_hash mismatch")
+            return
+
+        self.counter_store.set_last_counter(self.uid_hash, result.counter)
 
         now = self._last_any_advertisement_monotonic
         self.state.raw_rssi = float(adv.rssi)
